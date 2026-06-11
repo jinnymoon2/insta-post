@@ -6,30 +6,27 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "next lint"
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
     "file-saver": "^2.0.5",
     "html-to-image": "^1.11.13",
-    "jsdom": "^29.1.1",
-    "jspdf": "^4.2.1",
+    "jsdom": "^26.1.0",
     "jszip": "^3.10.1",
-    "next": "16.2.9",
-    "react": "19.2.4",
-    "react-dom": "19.2.4",
-    "zod": "^4.4.3"
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "zod": "^3.24.2"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4",
     "@types/file-saver": "^2.0.7",
-    "@types/jsdom": "^28.0.3",
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "eslint": "^9",
-    "eslint-config-next": "16.2.9",
-    "tailwindcss": "^4",
-    "typescript": "^5"
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "eslint": "latest",
+    "eslint-config-next": "latest",
+    "typescript": "latest"
   }
 }
