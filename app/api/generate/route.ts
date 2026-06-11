@@ -6,6 +6,8 @@ import { z } from "zod";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const ROUTE_VERSION = "generate-route-reader-fallback-v5";
+
 const GenerateSchema = z.object({
   mode: z.enum(["url", "text"]),
   url: z.string().optional(),
@@ -30,6 +32,15 @@ type AIResponse = {
   slides: InstaSlide[];
 };
 
+type CommonsPage = {
+  imageinfo?: Array<{
+    thumburl?: string;
+    url?: string;
+    descriptionurl?: string;
+    extmetadata?: Record<string, { value?: string }>;
+  }>;
+};
+
 function cleanText(input: string) {
   return input
     .replace(/\s+/g, " ")
@@ -38,8 +49,7 @@ function cleanText(input: string) {
 }
 
 function clampSourceText(input: string) {
-  const cleaned = cleanText(input);
-  return cleaned.slice(0, 24000);
+  return cleanText(input).slice(0, 24000);
 }
 
 async function extractArticleFromUrl(url: string) {
@@ -55,45 +65,137 @@ async function extractArticleFromUrl(url: string) {
     throw new Error("Only http and https links are allowed.");
   }
 
-  const response = await fetch(parsed.toString(), {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (compatible; InstaPostBot/1.0; +https://example.com)"
-    },
-    cache: "no-store"
-  });
+  const errors: string[] = [];
 
-  if (!response.ok) {
-    throw new Error(`Could not fetch article. Status: ${response.status}`);
+  async function tryDirectFetch() {
+    const response = await fetch(parsed.toString(), {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ko;q=0.8"
+      },
+      cache: "no-store"
+    });
+
+    if (!response.ok) {
+      throw new Error(`Direct fetch failed with status ${response.status}`);
+    }
+
+    const html = await response.text();
+    const dom = new JSDOM(html, { url: parsed.toString() });
+    const reader = new Readability(dom.window.document);
+    const article = reader.parse();
+
+    const title =
+      article?.title ||
+      dom.window.document.querySelector("title")?.textContent ||
+      "Untitled Article";
+
+    const text =
+      article?.textContent ||
+      dom.window.document.body?.textContent ||
+      "";
+
+    const cleaned = cleanText(text);
+
+    if (cleaned.length < 300) {
+      throw new Error("Direct fetch returned too little readable text.");
+    }
+
+    return {
+      title: cleanText(title),
+      text: clampSourceText(cleaned)
+    };
   }
 
-  const html = await response.text();
-  const dom = new JSDOM(html, { url: parsed.toString() });
-  const reader = new Readability(dom.window.document);
-  const article = reader.parse();
+  async function tryJinaReaderOne() {
+    const jinaUrl = `https://r.jina.ai/http://${parsed.href.replace(
+      /^https?:\/\//,
+      ""
+    )}`;
 
-  const title =
-    article?.title ||
-    dom.window.document.querySelector("title")?.textContent ||
-    "Untitled Article";
+    const response = await fetch(jinaUrl, {
+      headers: {
+        Accept: "text/plain",
+        "User-Agent": "Mozilla/5.0"
+      },
+      cache: "no-store"
+    });
 
-  const text =
-    article?.textContent ||
-    dom.window.document.body?.textContent ||
-    "";
+    if (!response.ok) {
+      throw new Error(`Jina Reader one failed with status ${response.status}`);
+    }
 
-  const cleaned = cleanText(text);
+    const markdown = await response.text();
+    const cleaned = cleanText(markdown);
 
-  if (cleaned.length < 300) {
-    throw new Error(
-      "The article text was too short. This may be a paywalled, blocked, or JavaScript-rendered page."
-    );
+    if (cleaned.length < 300) {
+      throw new Error("Jina Reader one returned too little readable text.");
+    }
+
+    const titleMatch = markdown.match(/^Title:\s*(.+)$/m);
+
+    return {
+      title: cleanText(titleMatch?.[1] || "Article Summary"),
+      text: clampSourceText(cleaned)
+    };
   }
 
-  return {
-    title: cleanText(title),
-    text: clampSourceText(cleaned)
-  };
+  async function tryJinaReaderTwo() {
+    const jinaUrl = `https://r.jina.ai/${parsed.href}`;
+
+    const response = await fetch(jinaUrl, {
+      headers: {
+        Accept: "text/plain",
+        "User-Agent": "Mozilla/5.0"
+      },
+      cache: "no-store"
+    });
+
+    if (!response.ok) {
+      throw new Error(`Jina Reader two failed with status ${response.status}`);
+    }
+
+    const markdown = await response.text();
+    const cleaned = cleanText(markdown);
+
+    if (cleaned.length < 300) {
+      throw new Error("Jina Reader two returned too little readable text.");
+    }
+
+    const titleMatch = markdown.match(/^Title:\s*(.+)$/m);
+
+    return {
+      title: cleanText(titleMatch?.[1] || "Article Summary"),
+      text: clampSourceText(cleaned)
+    };
+  }
+
+  try {
+    return await tryDirectFetch();
+  } catch (error: any) {
+    errors.push(error?.message || "Direct fetch failed.");
+  }
+
+  try {
+    return await tryJinaReaderOne();
+  } catch (error: any) {
+    errors.push(error?.message || "Jina Reader one failed.");
+  }
+
+  try {
+    return await tryJinaReaderTwo();
+  } catch (error: any) {
+    errors.push(error?.message || "Jina Reader two failed.");
+  }
+
+  throw new Error(
+    `Could not read this article automatically. Please use Paste Writing mode instead. Details: ${errors.join(
+      " | "
+    )}`
+  );
 }
 
 function buildPrompt(args: {
@@ -131,7 +233,6 @@ Style:
 For each slide, also create an imageQuery for searching a background image.
 The imageQuery should be 2 to 5 English words.
 Use visual concepts, not abstract sentences.
-Good examples: "artificial intelligence", "startup office", "climate change", "computer code", "city night".
 
 Return only valid JSON.
 No markdown.
@@ -166,9 +267,11 @@ function extractJson(text: string) {
     return JSON.parse(trimmed);
   } catch {
     const match = trimmed.match(/\{[\s\S]*\}/);
+
     if (!match) {
       throw new Error("AI did not return valid JSON.");
     }
+
     return JSON.parse(match[0]);
   }
 }
@@ -192,8 +295,7 @@ async function callHuggingFace(prompt: string): Promise<AIResponse> {
       messages: [
         {
           role: "system",
-          content:
-            "You are a careful social media editor. You only output valid JSON."
+          content: "You are a careful social media editor. You only output valid JSON."
         },
         {
           role: "user",
@@ -224,15 +326,6 @@ async function callHuggingFace(prompt: string): Promise<AIResponse> {
   return extractJson(content) as AIResponse;
 }
 
-type CommonsPage = {
-  imageinfo?: Array<{
-    thumburl?: string;
-    url?: string;
-    descriptionurl?: string;
-    extmetadata?: Record<string, { value?: string }>;
-  }>;
-};
-
 async function searchCommonsImage(query: string) {
   const searchUrl = new URL("https://commons.wikimedia.org/w/api.php");
 
@@ -256,6 +349,7 @@ async function searchCommonsImage(query: string) {
   }
 
   const data = await response.json();
+
   const pages = Object.values(
     (data?.query?.pages ?? {}) as Record<string, CommonsPage>
   );
@@ -264,6 +358,7 @@ async function searchCommonsImage(query: string) {
     .map((page) => {
       const info = page.imageinfo?.[0];
       const meta = info?.extmetadata || {};
+
       return {
         imageUrl: info?.thumburl || info?.url,
         imageCredit:
@@ -302,6 +397,13 @@ function normalizeAIResponse(ai: AIResponse, pageCount: number): AIResponse {
       imageQuery: cleanText(slide.imageQuery || "abstract background")
     }))
   };
+}
+
+export async function GET() {
+  return NextResponse.json({
+    ok: true,
+    route: ROUTE_VERSION
+  });
 }
 
 export async function POST(request: NextRequest) {
@@ -354,18 +456,17 @@ export async function POST(request: NextRequest) {
     );
 
     return NextResponse.json({
+      route: ROUTE_VERSION,
       title: ai.title,
       caption: ai.caption,
       hashtags: ai.hashtags,
       slides: slidesWithImages
     });
-  } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : "Something went wrong.";
-
+  } catch (error: any) {
     return NextResponse.json(
       {
-        error: message
+        route: ROUTE_VERSION,
+        error: error?.message || "Something went wrong."
       },
       {
         status: 400
