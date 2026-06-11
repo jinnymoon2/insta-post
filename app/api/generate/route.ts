@@ -224,6 +224,15 @@ async function callHuggingFace(prompt: string): Promise<AIResponse> {
   return extractJson(content) as AIResponse;
 }
 
+type CommonsPage = {
+  imageinfo?: Array<{
+    thumburl?: string;
+    url?: string;
+    descriptionurl?: string;
+    extmetadata?: Record<string, { value?: string }>;
+  }>;
+};
+
 async function searchCommonsImage(query: string) {
   const searchUrl = new URL("https://commons.wikimedia.org/w/api.php");
 
@@ -247,7 +256,9 @@ async function searchCommonsImage(query: string) {
   }
 
   const data = await response.json();
-  const pages = Object.values(data?.query?.pages || {}) as any[];
+  const pages = Object.values(
+    (data?.query?.pages ?? {}) as Record<string, CommonsPage>
+  );
 
   const usable = pages
     .map((page) => {
@@ -348,10 +359,13 @@ export async function POST(request: NextRequest) {
       hashtags: ai.hashtags,
       slides: slidesWithImages
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message =
+      error instanceof Error ? error.message : "Something went wrong.";
+
     return NextResponse.json(
       {
-        error: error?.message || "Something went wrong."
+        error: message
       },
       {
         status: 400
