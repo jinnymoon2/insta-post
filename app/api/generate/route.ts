@@ -1,476 +1,756 @@
-import { NextRequest, NextResponse } from "next/server";
-import { Readability } from "@mozilla/readability";
-import { JSDOM } from "jsdom";
-import { z } from "zod";
+const ROUTE_VERSION = "generate-route-input-modes-20-pages-v12";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const ROUTE_VERSION = "generate-route-reader-fallback-v5";
+type LanguageMode = "auto" | "ko" | "en";
+type InputMode = "url" | "text";
 
-const GenerateSchema = z.object({
-  mode: z.enum(["url", "text"]),
-  url: z.string().optional(),
-  text: z.string().optional(),
-  pageCount: z.number().int().min(5).max(20),
-  language: z.enum(["auto", "english", "korean"]).default("auto")
-});
-
-type InstaSlide = {
-  page: number;
-  sentence: string;
-  imageQuery: string;
-  imageUrl?: string;
-  imageCredit?: string;
-  imagePageUrl?: string;
+type GeneratedSlide = {
+  title: string;
+  text: string;
+  imageUrl: string;
 };
 
-type AIResponse = {
+type GenerateResponse = {
   title: string;
   caption: string;
   hashtags: string[];
-  slides: InstaSlide[];
+  slides: GeneratedSlide[];
+  sourceUrl?: string;
+  detectedLanguage: "ko" | "en";
+  backgroundImageUrl: string;
+  routeVersion: string;
 };
 
-type CommonsPage = {
-  imageinfo?: Array<{
-    thumburl?: string;
-    url?: string;
-    descriptionurl?: string;
-    extmetadata?: Record<string, { value?: string }>;
-  }>;
-};
+const FALLBACK_IMAGE =
+  "https://upload.wikimedia.org/wikipedia/commons/thumb/7/72/Placeholder_book.svg/1200px-Placeholder_book.svg.png";
 
-function cleanText(input: string) {
-  return input
-    .replace(/\s+/g, " ")
-    .replace(/\u00a0/g, " ")
-    .trim();
-}
+const DEFAULT_MODEL = "mistralai/Mistral-7B-Instruct-v0.3";
 
-function clampSourceText(input: string) {
-  return cleanText(input).slice(0, 24000);
-}
+function normalizeOptionalUrl(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
 
-async function extractArticleFromUrl(url: string) {
+  const trimmed = value.trim();
+
+  if (!trimmed) return undefined;
+
   let parsed: URL;
 
   try {
-    parsed = new URL(url);
+    parsed = new URL(trimmed);
   } catch {
-    throw new Error("Invalid URL.");
+    throw new Error("Invalid article URL.");
   }
 
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new Error("Only http and https links are allowed.");
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Only http and https URLs are allowed.");
   }
 
-  const errors: string[] = [];
+  return parsed.toString();
+}
 
-  async function tryDirectFetch() {
-    const response = await fetch(parsed.toString(), {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,ko;q=0.8"
-      },
-      cache: "no-store"
-    });
+function normalizeArticleText(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
 
-    if (!response.ok) {
-      throw new Error(`Direct fetch failed with status ${response.status}`);
-    }
+  const cleaned = value.replace(/\s+/g, " ").trim();
 
-    const html = await response.text();
-    const dom = new JSDOM(html, { url: parsed.toString() });
-    const reader = new Readability(dom.window.document);
-    const article = reader.parse();
+  if (!cleaned) return undefined;
 
-    const title =
-      article?.title ||
-      dom.window.document.querySelector("title")?.textContent ||
-      "Untitled Article";
-
-    const text =
-      article?.textContent ||
-      dom.window.document.body?.textContent ||
-      "";
-
-    const cleaned = cleanText(text);
-
-    if (cleaned.length < 300) {
-      throw new Error("Direct fetch returned too little readable text.");
-    }
-
-    return {
-      title: cleanText(title),
-      text: clampSourceText(cleaned)
-    };
+  if (cleaned.length < 80) {
+    throw new Error("Article text is too short. Please paste more content.");
   }
 
-  async function tryJinaReaderOne() {
-    const jinaUrl = `https://r.jina.ai/http://${parsed.href.replace(
-      /^https?:\/\//,
-      ""
-    )}`;
+  return cleaned.slice(0, 9000);
+}
 
-    const response = await fetch(jinaUrl, {
-      headers: {
-        Accept: "text/plain",
-        "User-Agent": "Mozilla/5.0"
-      },
-      cache: "no-store"
-    });
+function normalizeSlideCount(value: unknown): number {
+  const numberValue = Number(value);
 
-    if (!response.ok) {
-      throw new Error(`Jina Reader one failed with status ${response.status}`);
-    }
+  if (!Number.isFinite(numberValue)) return 5;
 
-    const markdown = await response.text();
-    const cleaned = cleanText(markdown);
+  return Math.min(20, Math.max(1, Math.floor(numberValue)));
+}
 
-    if (cleaned.length < 300) {
-      throw new Error("Jina Reader one returned too little readable text.");
-    }
-
-    const titleMatch = markdown.match(/^Title:\s*(.+)$/m);
-
-    return {
-      title: cleanText(titleMatch?.[1] || "Article Summary"),
-      text: clampSourceText(cleaned)
-    };
+function normalizeInputMode(value: unknown): InputMode {
+  if (value === "url" || value === "text") {
+    return value;
   }
 
-  async function tryJinaReaderTwo() {
-    const jinaUrl = `https://r.jina.ai/${parsed.href}`;
+  return "url";
+}
 
-    const response = await fetch(jinaUrl, {
-      headers: {
-        Accept: "text/plain",
-        "User-Agent": "Mozilla/5.0"
-      },
-      cache: "no-store"
-    });
-
-    if (!response.ok) {
-      throw new Error(`Jina Reader two failed with status ${response.status}`);
-    }
-
-    const markdown = await response.text();
-    const cleaned = cleanText(markdown);
-
-    if (cleaned.length < 300) {
-      throw new Error("Jina Reader two returned too little readable text.");
-    }
-
-    const titleMatch = markdown.match(/^Title:\s*(.+)$/m);
-
-    return {
-      title: cleanText(titleMatch?.[1] || "Article Summary"),
-      text: clampSourceText(cleaned)
-    };
+function normalizeLanguageMode(value: unknown): LanguageMode {
+  if (value === "ko" || value === "en" || value === "auto") {
+    return value;
   }
 
-  try {
-    return await tryDirectFetch();
-  } catch (error: any) {
-    errors.push(error?.message || "Direct fetch failed.");
-  }
+  return "auto";
+}
 
-  try {
-    return await tryJinaReaderOne();
-  } catch (error: any) {
-    errors.push(error?.message || "Jina Reader one failed.");
-  }
+function detectLanguage(text: string): "ko" | "en" {
+  const koreanMatches = text.match(/[가-힣]/g)?.length ?? 0;
+  const latinMatches = text.match(/[A-Za-z]/g)?.length ?? 0;
 
-  try {
-    return await tryJinaReaderTwo();
-  } catch (error: any) {
-    errors.push(error?.message || "Jina Reader two failed.");
-  }
+  return koreanMatches > latinMatches * 0.15 ? "ko" : "en";
+}
 
-  throw new Error(
-    `Could not read this article automatically. Please use Paste Writing mode instead. Details: ${errors.join(
-      " | "
-    )}`
+function getOutputLanguage(
+  articleText: string,
+  languageMode: LanguageMode,
+): "ko" | "en" {
+  if (languageMode === "ko") return "ko";
+  if (languageMode === "en") return "en";
+
+  return detectLanguage(articleText);
+}
+
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getMetaContent(html: string, propertyOrName: string): string | null {
+  const escaped = propertyOrName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const propertyRegex = new RegExp(
+    `<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+    "i",
+  );
+
+  const nameRegex = new RegExp(
+    `<meta[^>]+name=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+    "i",
+  );
+
+  const reversePropertyRegex = new RegExp(
+    `<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${escaped}["'][^>]*>`,
+    "i",
+  );
+
+  const reverseNameRegex = new RegExp(
+    `<meta[^>]+content=["']([^"']+)["'][^>]+name=["']${escaped}["'][^>]*>`,
+    "i",
+  );
+
+  return (
+    propertyRegex.exec(html)?.[1] ??
+    nameRegex.exec(html)?.[1] ??
+    reversePropertyRegex.exec(html)?.[1] ??
+    reverseNameRegex.exec(html)?.[1] ??
+    null
   );
 }
 
-function buildPrompt(args: {
-  sourceTitle: string;
-  sourceText: string;
-  pageCount: number;
-  language: "auto" | "english" | "korean";
-}) {
+function getTitleFromHtml(html: string): string {
+  const ogTitle = getMetaContent(html, "og:title");
+
+  if (ogTitle) {
+    return stripHtml(ogTitle);
+  }
+
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+
+  if (titleMatch?.[1]) {
+    return stripHtml(titleMatch[1]);
+  }
+
+  return "Article Summary";
+}
+
+function absolutizeUrl(value: string | null, baseUrl: string): string | null {
+  if (!value) return null;
+
+  try {
+    return new URL(value, baseUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+function getBestImageFromHtml(html: string, baseUrl: string): string {
+  const ogImage =
+    getMetaContent(html, "og:image") ??
+    getMetaContent(html, "twitter:image") ??
+    getMetaContent(html, "twitter:image:src");
+
+  const absoluteOgImage = absolutizeUrl(ogImage, baseUrl);
+
+  if (absoluteOgImage) {
+    return absoluteOgImage;
+  }
+
+  const imgMatch = html.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
+  const absoluteImg = absolutizeUrl(imgMatch?.[1] ?? null, baseUrl);
+
+  return absoluteImg ?? FALLBACK_IMAGE;
+}
+
+async function fetchArticle(url: string): Promise<{
+  title: string;
+  text: string;
+  imageUrl: string;
+}> {
+  const errors: string[] = [];
+
+  async function fetchDirectArticle() {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+        Referer: "https://www.google.com/",
+      },
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      throw new Error(`Direct fetch failed with status ${response.status}.`);
+    }
+
+    const html = await response.text();
+    const title = getTitleFromHtml(html);
+    const imageUrl = getBestImageFromHtml(html, url);
+    const text = stripHtml(html).slice(0, 9000);
+
+    if (!text || text.length < 200) {
+      throw new Error("Direct fetch did not return enough readable text.");
+    }
+
+    return {
+      title,
+      text,
+      imageUrl,
+    };
+  }
+
+  async function fetchReaderArticle(readerUrl: string) {
+    const response = await fetch(readerUrl, {
+      method: "GET",
+      headers: {
+        Accept: "text/plain, text/markdown, */*",
+        "User-Agent":
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
+      },
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      throw new Error(`Reader fetch failed with status ${response.status}.`);
+    }
+
+    const markdown = await response.text();
+    const titleMatch = markdown.match(/^Title:\s*(.+)$/im);
+    const imageMatch =
+      markdown.match(/^Image:\s*(https?:\/\/\S+)$/im) ??
+      markdown.match(/!\[[^\]]*]\((https?:\/\/[^)\s]+)[^)]*\)/i);
+    const text = markdown
+      .replace(/^Title:\s*.+$/gim, " ")
+      .replace(/^URL Source:\s*.+$/gim, " ")
+      .replace(/^Markdown Content:\s*/gim, " ")
+      .replace(/!\[[^\]]*]\([^)]+\)/g, " ")
+      .replace(/\[[^\]]+]\([^)]+\)/g, " ")
+      .replace(/[#*_>`~-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 9000);
+
+    if (!text || text.length < 200) {
+      throw new Error("Reader fetch did not return enough readable text.");
+    }
+
+    return {
+      title: titleMatch?.[1]?.trim() || "Article Summary",
+      text,
+      imageUrl: imageMatch?.[1] || FALLBACK_IMAGE,
+    };
+  }
+
+  try {
+    return await fetchDirectArticle();
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : "Direct fetch failed.");
+  }
+
+  const parsed = new URL(url);
+  const readerUrls = [
+    `https://r.jina.ai/http://${parsed.href.replace(/^https?:\/\//, "")}`,
+    `https://r.jina.ai/${parsed.href}`,
+  ];
+
+  for (const readerUrl of readerUrls) {
+    try {
+      return await fetchReaderArticle(readerUrl);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : "Reader fetch failed.");
+    }
+  }
+
+  throw new Error(
+    `This article site blocked automatic reading. Paste the article text into the Article text box and generate again. Details: ${errors.join(" ")}`,
+  );
+}
+
+function extractFirstJsonObject(text: string): unknown | null {
+  const cleaned = text
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Continue to extraction.
+  }
+
+  const start = cleaned.indexOf("{");
+
+  if (start === -1) {
+    return null;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < cleaned.length; i += 1) {
+    const char = cleaned[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) {
+      continue;
+    }
+
+    if (char === "{") {
+      depth += 1;
+    }
+
+    if (char === "}") {
+      depth -= 1;
+
+      if (depth === 0) {
+        const jsonOnly = cleaned.slice(start, i + 1);
+
+        try {
+          return JSON.parse(jsonOnly);
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function asString(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+
+  const trimmed = value.trim();
+
+  return trimmed.length > 0 ? trimmed : fallback;
+}
+
+function asStringArray(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) return fallback;
+
+  const cleaned = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  return cleaned.length > 0 ? cleaned : fallback;
+}
+
+function splitIntoSentences(text: string): string[] {
+  return text
+    .split(/(?<=[.!?。！？다요죠음임까])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 20);
+}
+
+function selectRepresentativeSentences(text: string, slideCount: number): string[] {
+  const sentences = splitIntoSentences(text);
+
+  if (sentences.length >= slideCount) {
+    return Array.from({ length: slideCount }, (_, index) => {
+      const sentenceIndex =
+        slideCount === 1
+          ? Math.floor(sentences.length / 2)
+          : Math.round((index * (sentences.length - 1)) / (slideCount - 1));
+
+      return sentences[sentenceIndex];
+    });
+  }
+
+  const chunkSize = Math.max(120, Math.ceil(text.length / slideCount));
+
+  return Array.from({ length: slideCount }, (_, index) => {
+    const start = index * chunkSize;
+    const chunk = text.slice(start, start + chunkSize).trim();
+
+    return chunk || text.slice(0, 180);
+  });
+}
+
+function makeFallbackPost(
+  article: {
+    title: string;
+    text: string;
+    imageUrl: string;
+  },
+  sourceUrl: string | undefined,
+  slideCount: number,
+  detectedLanguage: "ko" | "en",
+): GenerateResponse {
+  const sentences = selectRepresentativeSentences(article.text, slideCount);
+
+  const fallbackTexts =
+    sentences.length >= slideCount
+      ? sentences
+      : detectedLanguage === "ko"
+        ? [
+            article.text.slice(0, 180),
+            "이 글은 독자가 빠르게 이해해야 할 핵심 내용을 담고 있습니다.",
+            "핵심은 이 이슈가 앞으로 어떤 변화로 이어질지 살펴보는 것입니다.",
+          ]
+        : [
+            article.text.slice(0, 180),
+            "This article highlights an important topic readers may want to understand quickly.",
+            "The key point is to watch what changes next and why it matters.",
+          ];
+
+  const koTitles = ["무슨 일이 있었나", "왜 중요한가", "핵심 내용", "맥락", "정리"];
+  const enTitles = ["What happened", "Why it matters", "Key detail", "Context", "Takeaway"];
+  const titles = detectedLanguage === "ko" ? koTitles : enTitles;
+
+  return {
+    title: article.title,
+    caption:
+      detectedLanguage === "ko"
+        ? `${article.title}\n\n기사의 핵심 내용을 인스타그램 캐러셀 형식으로 정리했습니다.`
+        : `${article.title}\n\nHere is a quick summary of the article in carousel format.`,
+    hashtags:
+      detectedLanguage === "ko"
+        ? ["#뉴스", "#요약", "#인스타그램"]
+        : ["#news", "#summary", "#instagram"],
+    slides: Array.from({ length: slideCount }, (_, index) => ({
+      title: titles[index] ?? `Slide ${index + 1}`,
+      text: fallbackTexts[index] ?? fallbackTexts[fallbackTexts.length - 1],
+      imageUrl: article.imageUrl,
+    })),
+    sourceUrl,
+    detectedLanguage,
+    backgroundImageUrl: article.imageUrl,
+    routeVersion: ROUTE_VERSION,
+  };
+}
+
+function normalizeGeneratedResult(
+  raw: unknown,
+  article: {
+    title: string;
+    text: string;
+    imageUrl: string;
+  },
+  sourceUrl: string | undefined,
+  slideCount: number,
+  detectedLanguage: "ko" | "en",
+): GenerateResponse {
+  const fallback = makeFallbackPost(article, sourceUrl, slideCount, detectedLanguage);
+
+  if (!raw || typeof raw !== "object") {
+    return fallback;
+  }
+
+  const record = raw as Record<string, unknown>;
+  const rawSlides = Array.isArray(record.slides) ? record.slides : [];
+
+  const slides = rawSlides
+    .map((item, index): GeneratedSlide | null => {
+      if (!item || typeof item !== "object") return null;
+
+      const slide = item as Record<string, unknown>;
+
+      return {
+        title: asString(slide.title, `Slide ${index + 1}`),
+        text: asString(slide.text ?? slide.body ?? slide.description, ""),
+        imageUrl: article.imageUrl,
+      };
+    })
+    .filter(
+      (slide): slide is GeneratedSlide =>
+        slide !== null && slide.text.trim().length > 0,
+    )
+    .slice(0, slideCount);
+
+  if (slides.length < slideCount) {
+    const fallbackSlides = fallback.slides.slice(slides.length);
+    slides.push(...fallbackSlides);
+  }
+
+  if (slides.length === 0) {
+    return fallback;
+  }
+
+  return {
+    title: asString(record.title, article.title),
+    caption: asString(
+      record.caption,
+      detectedLanguage === "ko"
+        ? `${article.title}\n\n기사의 핵심 내용을 인스타그램 캐러셀 형식으로 정리했습니다.`
+        : `${article.title}\n\nA quick summary of the key points from this article.`,
+    ),
+    hashtags: asStringArray(
+      record.hashtags,
+      detectedLanguage === "ko"
+        ? ["#뉴스", "#요약", "#인스타그램"]
+        : ["#news", "#summary", "#instagram"],
+    ),
+    slides,
+    sourceUrl,
+    detectedLanguage,
+    backgroundImageUrl: article.imageUrl,
+    routeVersion: ROUTE_VERSION,
+  };
+}
+
+function buildPrompt(params: {
+  article: { title: string; text: string };
+  slideCount: number;
+  outputLanguage: "ko" | "en";
+}): string {
   const languageInstruction =
-    args.language === "korean"
-      ? "Write the output in Korean."
-      : args.language === "english"
-        ? "Write the output in English."
-        : "Use the same main language as the source text.";
+    params.outputLanguage === "ko"
+      ? "Write the entire Instagram post in Korean. If the article is English, translate and localize the content naturally into Korean."
+      : "Write the entire Instagram post in English. If the article is Korean, translate and localize the content naturally into English.";
 
   return `
-You are InstaPost, an AI that turns articles and long writing into Instagram carousel posts.
+You are an Instagram content strategist.
 
-Task:
-Create exactly ${args.pageCount} Instagram carousel pages.
-Each page must contain 1 to 2 short sentences.
-The full carousel must summarize the entire source from beginning to end.
-The writing should feel Instagram-postable: clear, punchy, concise, and readable on a visual slide.
-Do not invent facts that are not in the source.
+Create an Instagram carousel post from this article.
 
-Style:
-- Each slide should focus on one idea.
-- The first slide should work as a hook.
-- The middle slides should explain the core points.
-- The final slide should give the takeaway.
-- Avoid long paragraphs.
-- Avoid generic filler.
-- ${languageInstruction}
+${languageInstruction}
 
-For each slide, also create an imageQuery for searching a background image.
-The imageQuery should be 2 to 5 English words.
-Use visual concepts, not abstract sentences.
+Article title:
+${params.article.title}
 
-Return only valid JSON.
+Article text:
+${params.article.text}
+
+Return one valid JSON object only.
 No markdown.
 No explanation.
+No comments.
+No extra text before or after the JSON.
 
-JSON format:
+Use exactly this JSON shape:
 {
-  "title": "short carousel title",
-  "caption": "short Instagram caption",
+  "title": "Short post title",
+  "caption": "Instagram caption",
   "hashtags": ["#tag1", "#tag2", "#tag3"],
   "slides": [
     {
-      "page": 1,
-      "sentence": "1-2 sentences for this page.",
-      "imageQuery": "background image search query"
+      "title": "Slide title",
+      "text": "Slide body text"
     }
   ]
 }
 
-Source title:
-${args.sourceTitle}
-
-Source text:
-${args.sourceText}
-`;
+Rules:
+- Make exactly ${params.slideCount} slides.
+- The slides must summarize the full article, including the beginning, middle, and end.
+- If ${params.slideCount} is small, compress the entire article into fewer broader points instead of covering only the first part.
+- Each slide title must be short.
+- Each slide text must be clear and concise.
+- Do not invent facts that are not in the article.
+- Make it understandable for a general audience.
+- Keep slide text suitable for an Instagram carousel.
+`.trim();
 }
 
-function extractJson(text: string) {
-  const trimmed = text.trim();
+async function callHuggingFace(prompt: string): Promise<unknown | null> {
+  const hfToken = process.env.HF_TOKEN?.trim();
+  const model = process.env.HF_MODEL?.trim() || DEFAULT_MODEL;
 
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const match = trimmed.match(/\{[\s\S]*\}/);
-
-    if (!match) {
-      throw new Error("AI did not return valid JSON.");
-    }
-
-    return JSON.parse(match[0]);
-  }
-}
-
-async function callHuggingFace(prompt: string): Promise<AIResponse> {
-  const token = process.env.HF_TOKEN;
-  const model = process.env.HF_MODEL || "Qwen/Qwen2.5-7B-Instruct-1M";
-
-  if (!token) {
-    throw new Error("Missing HF_TOKEN in .env.local.");
-  }
-
-  const response = await fetch("https://router.huggingface.co/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        {
-          role: "system",
-          content: "You are a careful social media editor. You only output valid JSON."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
-      ],
-      temperature: 0.7,
-      max_tokens: 2500
-    })
-  });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data?.error?.message ||
-        data?.message ||
-        `Hugging Face request failed with status ${response.status}.`
-    );
-  }
-
-  const content = data?.choices?.[0]?.message?.content;
-
-  if (!content) {
-    throw new Error("Hugging Face returned an empty response.");
-  }
-
-  return extractJson(content) as AIResponse;
-}
-
-async function searchCommonsImage(query: string) {
-  const searchUrl = new URL("https://commons.wikimedia.org/w/api.php");
-
-  searchUrl.searchParams.set("action", "query");
-  searchUrl.searchParams.set("format", "json");
-  searchUrl.searchParams.set("origin", "*");
-  searchUrl.searchParams.set("generator", "search");
-  searchUrl.searchParams.set("gsrsearch", `${query} filetype:bitmap`);
-  searchUrl.searchParams.set("gsrnamespace", "6");
-  searchUrl.searchParams.set("gsrlimit", "8");
-  searchUrl.searchParams.set("prop", "imageinfo");
-  searchUrl.searchParams.set("iiprop", "url|extmetadata");
-  searchUrl.searchParams.set("iiurlwidth", "1400");
-
-  const response = await fetch(searchUrl.toString(), {
-    cache: "no-store"
-  });
-
-  if (!response.ok) {
+  if (!hfToken) {
+    console.error("[huggingface:missing-token]");
     return null;
   }
 
-  const data = await response.json();
+  let response: Response;
 
-  const pages = Object.values(
-    (data?.query?.pages ?? {}) as Record<string, CommonsPage>
-  );
-
-  const usable = pages
-    .map((page) => {
-      const info = page.imageinfo?.[0];
-      const meta = info?.extmetadata || {};
-
-      return {
-        imageUrl: info?.thumburl || info?.url,
-        imageCredit:
-          meta.Artist?.value?.replace(/<[^>]*>/g, "") ||
-          meta.Credit?.value?.replace(/<[^>]*>/g, "") ||
-          "Wikimedia Commons",
-        imagePageUrl: info?.descriptionurl
-      };
-    })
-    .filter((item) => {
-      if (!item.imageUrl) return false;
-      return /\.(jpg|jpeg|png|webp)(\?|$)/i.test(item.imageUrl);
-    });
-
-  return usable[0] || null;
-}
-
-function normalizeAIResponse(ai: AIResponse, pageCount: number): AIResponse {
-  const slides = Array.isArray(ai.slides) ? ai.slides.slice(0, pageCount) : [];
-
-  while (slides.length < pageCount) {
-    slides.push({
-      page: slides.length + 1,
-      sentence: "Add one clear takeaway from the article here.",
-      imageQuery: "digital abstract"
-    });
+  try {
+    response = await fetch(
+      `https://api-inference.huggingface.co/models/${encodeURIComponent(model)}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${hfToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          inputs: prompt,
+          parameters: {
+            max_new_tokens: 1800,
+            temperature: 0.2,
+            return_full_text: false,
+          },
+        }),
+      },
+    );
+  } catch (error) {
+    console.error("[huggingface:fetch-failed]", error);
+    return null;
   }
 
-  return {
-    title: ai.title || "InstaPost Carousel",
-    caption: ai.caption || "",
-    hashtags: Array.isArray(ai.hashtags) ? ai.hashtags.slice(0, 8) : [],
-    slides: slides.map((slide, index) => ({
-      page: index + 1,
-      sentence: cleanText(slide.sentence || ""),
-      imageQuery: cleanText(slide.imageQuery || "abstract background")
-    }))
-  };
+  const responseText = await response.text();
+
+  if (!response.ok) {
+    console.error("[huggingface:error]", response.status, responseText);
+    return null;
+  }
+
+  let data: unknown;
+
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    console.error("[huggingface:non-json-response]", responseText);
+    return null;
+  }
+
+  let generatedText = "";
+
+  if (Array.isArray(data)) {
+    const first = data[0];
+
+    if (first && typeof first === "object") {
+      const firstRecord = first as Record<string, unknown>;
+
+      generatedText = asString(
+        firstRecord.generated_text ??
+          firstRecord.summary_text ??
+          firstRecord.text,
+        "",
+      );
+    }
+  } else if (data && typeof data === "object") {
+    const record = data as Record<string, unknown>;
+
+    generatedText = asString(
+      record.generated_text ?? record.summary_text ?? record.text,
+      "",
+    );
+  }
+
+  if (!generatedText) {
+    console.error("[huggingface:empty-generated-text]", data);
+    return null;
+  }
+
+  return extractFirstJsonObject(generatedText);
+}
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+
+    const inputMode = normalizeInputMode(body.inputMode);
+    const sourceUrl =
+      inputMode === "url" ? normalizeOptionalUrl(body.url) : undefined;
+    const manualText =
+      inputMode === "text" ? normalizeArticleText(body.articleText) : undefined;
+    const slideCount = normalizeSlideCount(body.slideCount);
+    const languageMode = normalizeLanguageMode(body.languageMode);
+
+    let article: {
+      title: string;
+      text: string;
+      imageUrl: string;
+    };
+
+    if (manualText) {
+      article = {
+        title: asString(body.title, "Article Summary"),
+        text: manualText,
+        imageUrl: FALLBACK_IMAGE,
+      };
+    } else if (sourceUrl) {
+      article = await fetchArticle(sourceUrl);
+    } else if (inputMode === "text") {
+      throw new Error("Please paste at least 80 characters of text.");
+    } else {
+      throw new Error("Please enter an article URL.");
+    }
+
+    const detectedLanguage = getOutputLanguage(article.text, languageMode);
+
+    const prompt = buildPrompt({
+      article,
+      slideCount,
+      outputLanguage: detectedLanguage,
+    });
+
+    const rawGenerated = await callHuggingFace(prompt);
+    const normalized = normalizeGeneratedResult(
+      rawGenerated,
+      article,
+      sourceUrl,
+      slideCount,
+      detectedLanguage,
+    );
+
+    return Response.json(normalized);
+  } catch (error) {
+    console.error("[generate:error]", error);
+
+    const message =
+      error instanceof Error ? error.message : "Unknown error occurred.";
+
+    return Response.json(
+      {
+        error: message,
+        routeVersion: ROUTE_VERSION,
+      },
+      {
+        status: 500,
+      },
+    );
+  }
 }
 
 export async function GET() {
-  return NextResponse.json({
+  return Response.json({
     ok: true,
-    route: ROUTE_VERSION
+    routeVersion: ROUTE_VERSION,
   });
-}
-
-export async function POST(request: NextRequest) {
-  try {
-    const body = await request.json();
-    const parsed = GenerateSchema.parse(body);
-
-    let sourceTitle = "Pasted Writing";
-    let sourceText = "";
-
-    if (parsed.mode === "url") {
-      if (!parsed.url) {
-        throw new Error("URL is required.");
-      }
-
-      const article = await extractArticleFromUrl(parsed.url);
-      sourceTitle = article.title;
-      sourceText = article.text;
-    } else {
-      if (!parsed.text || cleanText(parsed.text).length < 300) {
-        throw new Error("Please paste at least 300 characters.");
-      }
-
-      sourceText = clampSourceText(parsed.text);
-    }
-
-    const prompt = buildPrompt({
-      sourceTitle,
-      sourceText,
-      pageCount: parsed.pageCount,
-      language: parsed.language
-    });
-
-    const aiRaw = await callHuggingFace(prompt);
-    const ai = normalizeAIResponse(aiRaw, parsed.pageCount);
-
-    const slidesWithImages = await Promise.all(
-      ai.slides.map(async (slide) => {
-        const image = await searchCommonsImage(slide.imageQuery);
-
-        return {
-          ...slide,
-          imageUrl:
-            image?.imageUrl ||
-            "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Fronalpstock_big.jpg/1400px-Fronalpstock_big.jpg",
-          imageCredit: image?.imageCredit || "Wikimedia Commons",
-          imagePageUrl: image?.imagePageUrl || "https://commons.wikimedia.org/"
-        };
-      })
-    );
-
-    return NextResponse.json({
-      route: ROUTE_VERSION,
-      title: ai.title,
-      caption: ai.caption,
-      hashtags: ai.hashtags,
-      slides: slidesWithImages
-    });
-  } catch (error: any) {
-    return NextResponse.json(
-      {
-        route: ROUTE_VERSION,
-        error: error?.message || "Something went wrong."
-      },
-      {
-        status: 400
-      }
-    );
-  }
 }
