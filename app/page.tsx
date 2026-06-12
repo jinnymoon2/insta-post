@@ -2,7 +2,6 @@
 
 import { saveAs } from "file-saver";
 import { toPng } from "html-to-image";
-import jsPDF from "jspdf";
 import JSZip from "jszip";
 import type { CSSProperties } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -27,8 +26,7 @@ type GenerateResponse = {
   };
 };
 
-const PAGE_WIDTH = 1080;
-const PAGE_HEIGHT = 1350;
+const PAGE_WIDTH = 1080; // export width; height follows the 4:5 card aspect (1350)
 const PAGE_COUNT_OPTIONS = Array.from({ length: 10 }, (_, index) => index + 1);
 
 export default function Home() {
@@ -235,17 +233,45 @@ export default function Home() {
     const node = slideRefs.current[index];
     if (!node) throw new Error(`Page ${index + 1} is not ready yet.`);
 
-    return toPng(node, {
+    // Make sure every <img> in the slide (the background photo) is fully loaded
+    // and decoded before capture. html-to-image renders a clone and silently
+    // drops images that aren't ready yet — the cause of the blank background.
+    const images = Array.from(node.querySelectorAll("img"));
+    await Promise.all(
+      images.map(async (img) => {
+        if (!img.complete) {
+          await new Promise<void>((resolve) => {
+            img.addEventListener("load", () => resolve(), { once: true });
+            img.addEventListener("error", () => resolve(), { once: true });
+          });
+        }
+        try {
+          await img.decode();
+        } catch {
+          /* decode can reject for already-painted images; safe to ignore */
+        }
+      }),
+    );
+
+    // Capture the slide at its NATURAL on-screen layout and scale it up via
+    // pixelRatio so the output is a fixed 1080x1350 (x2 for crispness). Forcing
+    // width/height/style on the clone instead made the content keep its smaller
+    // on-screen size and sit in the top-left corner of an oversized canvas.
+    const rect = node.getBoundingClientRect();
+    const targetWidth = PAGE_WIDTH * 2; // 2160px wide -> 2160x2700 output
+    const pixelRatio = rect.width > 0 ? targetWidth / rect.width : 2;
+
+    const options = {
       cacheBust: true,
-      pixelRatio: 2,
+      pixelRatio,
       backgroundColor: "#000000",
-      width: PAGE_WIDTH,
-      height: PAGE_HEIGHT,
-      style: {
-        width: `${PAGE_WIDTH}px`,
-        height: `${PAGE_HEIGHT}px`,
-      },
-    });
+    };
+
+    // The first capture frequently omits images while the cloned <img> elements
+    // load; rendering twice and keeping the second result is the documented
+    // html-to-image workaround for reliable image embedding.
+    await toPng(node, options);
+    return toPng(node, options);
   }
 
   async function downloadOne(index: number) {
@@ -280,34 +306,6 @@ export default function Home() {
       saveAs(blob, "instapost-carousel-pngs.zip");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not download PNGs.");
-    } finally {
-      setDownloading(false);
-    }
-  }
-
-  async function downloadPdf() {
-    if (slides.length === 0) return;
-    setDownloading(true);
-    setError("");
-    try {
-      const pdf = new jsPDF({
-        orientation: "portrait",
-        unit: "px",
-        format: [PAGE_WIDTH, PAGE_HEIGHT],
-        compress: true,
-      });
-
-      for (let index = 0; index < slides.length; index += 1) {
-        const png = await getSlidePng(index);
-        if (index > 0) {
-          pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT], "portrait");
-        }
-        pdf.addImage(png, "PNG", 0, 0, PAGE_WIDTH, PAGE_HEIGHT);
-      }
-
-      pdf.save("instapost-carousel.pdf");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not download PDF.");
     } finally {
       setDownloading(false);
     }
@@ -461,14 +459,6 @@ export default function Home() {
                   className="rounded-xl border border-white/15 bg-white/10 px-4 py-3 font-bold text-white disabled:opacity-50"
                 >
                   Download PNGs
-                </button>
-                <button
-                  type="button"
-                  onClick={downloadPdf}
-                  disabled={downloading}
-                  className="rounded-xl border border-white/15 bg-white/10 px-4 py-3 font-bold text-white disabled:opacity-50"
-                >
-                  Download PDF
                 </button>
               </div>
             </div>
