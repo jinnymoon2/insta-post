@@ -2,52 +2,49 @@ import { NextRequest, NextResponse } from "next/server";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-// On Vercel: Hobby caps functions at 10s, Pro at 60s. The fallback chain below can
-// take up to PRIMARY + RETRY seconds in the worst case, so give it headroom.
-// If you are on Hobby, lower the timeouts (see constants) instead of raising this.
-export const maxDuration = 30;
+export const maxDuration = 60;
 
-// ---------------------------------------------------------------------------
-// Config (read from .env.local — never commit real tokens)
-//
-//   POLLINATIONS_TOKEN=...        -> authenticated tier: nologo/private honored,
-//                                    much higher rate limits. Get one from the
-//                                    Pollinations auth portal (auth.pollinations.ai).
-//   POLLINATIONS_REFERRER=...     -> no-token option. Register your app's referrer
-//                                    with Pollinations for better limits than the
-//                                    fully-anonymous tier. e.g. "https://yourapp.com".
-//
-// Both are optional — the route still works anonymously, just with the strict
-// public rate limit (which is the usual reason you only ever see the gradient).
-// Pollinations' params/auth evolve; if something is ignored, check their current docs.
-// ---------------------------------------------------------------------------
-const POLLINATIONS_TOKEN = process.env.POLLINATIONS_TOKEN?.trim() ?? "";
-const POLLINATIONS_REFERRER = process.env.POLLINATIONS_REFERRER?.trim() ?? "";
-const HF_TOKEN = process.env.HF_TOKEN?.trim() ?? "";
-const HF_IMAGE_MODEL =
-  process.env.HF_IMAGE_MODEL?.trim() || "black-forest-labs/FLUX.1-schnell";
-
-const HF_IMAGE_TIMEOUT_MS = 25000;
-const PRIMARY_TIMEOUT_MS = 15000; // flux: best quality, slower
-const RETRY_TIMEOUT_MS = 12000; // turbo: faster, used when flux fails/times out
 const EXTERNAL_TIMEOUT_MS = 12000; // pass-through fetch for real http(s) image URLs
+// Pexels: real, topic-relevant stock photos via keyword search. Free API key
+// (open registration at https://www.pexels.com/api/). Set PEXELS_API_KEY.
+const PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search";
+const PEXELS_TIMEOUT_MS = 12000;
 const MIN_IMAGE_BYTES = 512; // reject tiny error payloads mislabeled as images
+
+function getOptionalEnvValue(name: string) {
+  return process.env[name]?.trim() ?? "";
+}
+
+// Everything after "instapost-generated://slide-N/" — i.e. the encoded page
+// prompt plus an optional "?topic=..." carrying the whole-article keywords.
+function extractGeneratedTail(rawUrl: string) {
+  const match = rawUrl.match(/^instapost-generated:\/\/[^/]+\/(.*)$/);
+  return match ? match[1] : "";
+}
 
 function extractPrompt(rawUrl: string) {
   if (!rawUrl) return "abstract editorial background, blue green neon gradient, no text";
 
   if (rawUrl.startsWith("instapost-generated://")) {
-    const lastSlash = rawUrl.lastIndexOf("/");
-    const encoded = lastSlash >= 0 ? rawUrl.slice(lastSlash + 1) : rawUrl;
-
+    const path = extractGeneratedTail(rawUrl).split("?")[0];
     try {
-      return decodeURIComponent(encoded);
+      return decodeURIComponent(path);
     } catch {
-      return rawUrl;
+      return path || rawUrl;
     }
   }
 
   return rawUrl;
+}
+
+// The whole-article keyword string the generate route attached as ?topic=...
+function extractTopic(rawUrl: string) {
+  if (!rawUrl.startsWith("instapost-generated://")) return "";
+  const tail = extractGeneratedTail(rawUrl);
+  const queryIndex = tail.indexOf("?");
+  if (queryIndex === -1) return "";
+  // URLSearchParams decodes the percent-encoding for us.
+  return new URLSearchParams(tail.slice(queryIndex + 1)).get("topic") ?? "";
 }
 
 function cleanPrompt(value: string) {
@@ -57,83 +54,6 @@ function cleanPrompt(value: string) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 260);
-}
-
-// Deterministic seed so the same prompt yields the same image on every load.
-// This makes the result cacheable per-URL and stops backgrounds from re-rolling.
-function promptSeed(value: string) {
-  let seed = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    seed = (seed * 31 + value.charCodeAt(index)) % 1000000;
-  }
-  return seed;
-}
-
-function buildPollinationsUrl(
-  prompt: string,
-  options: { model: string; enhance: boolean; seed: number },
-) {
-  const finalPrompt = [
-    cleanPrompt(prompt),
-    "vertical Instagram carousel background",
-    "editorial magazine style",
-    "dark lower area for white text",
-    "blue and green accent lighting",
-    "high quality",
-    "no words",
-    "no letters",
-    "no watermark",
-  ].join(", ");
-
-  const params = new URLSearchParams({
-    width: "1080",
-    height: "1350",
-    model: options.model,
-    seed: String(options.seed),
-    nologo: "true",
-    private: "true",
-    safe: "true",
-  });
-  // `enhance` runs a prompt-rewriting LLM step — nicer output, but adds latency
-  // and is a common cause of timeouts. We only use it on the primary attempt.
-  if (options.enhance) params.set("enhance", "true");
-
-  // NOTE: token/referrer are sent as HEADERS (see pollinationsHeaders), not query
-  // params, to keep secrets out of URLs and server logs.
-  return `https://image.pollinations.ai/prompt/${encodeURIComponent(
-    finalPrompt,
-  )}?${params.toString()}`;
-}
-
-function buildImagePrompt(prompt: string) {
-  return [
-    cleanPrompt(prompt),
-    "vertical Instagram carousel background",
-    "editorial magazine photography",
-    "specific visible subject matter from the prompt",
-    "cinematic light",
-    "layered depth",
-    "dark lower area for white text overlay",
-    "high quality",
-    "no words",
-    "no letters",
-    "no watermark",
-  ].join(", ");
-}
-
-function pollinationsHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-  };
-  if (POLLINATIONS_TOKEN) {
-    // If your token isn't honored via header, Pollinations also accepts it as a
-    // `?token=` query param — but the header keeps it out of logs.
-    headers.Authorization = `Bearer ${POLLINATIONS_TOKEN}`;
-  }
-  if (POLLINATIONS_REFERRER) {
-    headers.Referer = POLLINATIONS_REFERRER;
-  }
-  return headers;
 }
 
 // Single fetch attempt. Returns the image bytes, or null on any failure
@@ -178,29 +98,153 @@ async function fetchAsImage(
   }
 }
 
-async function fetchHuggingFaceImage(prompt: string) {
-  if (!HF_TOKEN) return null;
+const PEXELS_STOP_WORDS = new Set([
+  "a", "an", "the", "and", "or", "of", "for", "with", "without", "from", "into",
+  "on", "in", "at", "to", "by", "is", "are", "being", "that", "this", "these",
+  "showing", "actively", "various", "multiple", "complex", "next", "many",
+  "editorial", "magazine", "photography", "cinematic", "light", "layered",
+  "depth", "dark", "lower", "area", "white", "text", "words", "watermark",
+  "no", "high", "quality", "vertical", "instagram", "carousel", "background",
+  "scene", "specific", "visible", "subject", "matter", "prompt", "slide",
+]);
 
-  const modelPath = HF_IMAGE_MODEL.split("/").map(encodeURIComponent).join("/");
-  const url = `https://router.huggingface.co/hf-inference/models/${modelPath}`;
+// Pull up to `limit` distinct, meaningful keywords out of a phrase.
+function extractKeywords(text: string, limit: number): string[] {
+  const words = cleanPrompt(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length >= 3 && !PEXELS_STOP_WORDS.has(word));
 
-  return fetchAsImage(url, {
-    label: "huggingface",
-    timeoutMs: HF_IMAGE_TIMEOUT_MS,
-    headers: {
-      Authorization: `Bearer ${HF_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      inputs: buildImagePrompt(prompt),
-      parameters: {
-        width: 1080,
-        height: 1350,
-        num_inference_steps: 4,
-        guidance_scale: 0,
-      },
-    }),
+  const unique: string[] = [];
+  for (const word of words) {
+    if (!unique.includes(word)) unique.push(word);
+    if (unique.length >= limit) break;
+  }
+  return unique;
+}
+
+type PexelsPhoto = {
+  alt?: string;
+  src?: {
+    large2x?: string;
+    large?: string;
+    portrait?: string;
+    original?: string;
+  };
+};
+
+type PexelsSearchResponse = { photos?: PexelsPhoto[] };
+
+async function searchPexels(apiKey: string, query: string): Promise<PexelsPhoto[] | null> {
+  const params = new URLSearchParams({
+    query,
+    orientation: "portrait",
+    per_page: "24",
+    size: "large",
   });
+
+  try {
+    const response = await fetch(`${PEXELS_SEARCH_URL}?${params.toString()}`, {
+      headers: { Authorization: apiKey },
+      cache: "no-store",
+      signal: AbortSignal.timeout(PEXELS_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      console.error(`[image] pexels search "${query}" failed: HTTP ${response.status} ${body.slice(0, 160)}`);
+      return null;
+    }
+
+    const data = (await response.json()) as PexelsSearchResponse;
+    return data.photos ?? [];
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[image] pexels search "${query}" error`, message);
+    return null;
+  }
+}
+
+// Score a candidate by how well its description matches the keywords. Page
+// keywords (specific to this slide) count double; article keywords (the overall
+// topic) count once. This is how we "choose the best" of the search results.
+function scorePhoto(photo: PexelsPhoto, pageKeywords: string[], articleKeywords: string[]) {
+  const alt = (photo.alt ?? "").toLowerCase();
+  if (!alt) return 0;
+
+  let score = 0;
+  for (const keyword of pageKeywords) if (alt.includes(keyword)) score += 2;
+  for (const keyword of articleKeywords) if (alt.includes(keyword)) score += 1;
+  return score;
+}
+
+function pickBestPhoto(photos: PexelsPhoto[], pageKeywords: string[], articleKeywords: string[]) {
+  let best: PexelsPhoto | null = null;
+  let bestScore = -1;
+
+  // Photos are already returned in Pexels relevance order, so a strict ">"
+  // keeps the most relevant one when scores tie.
+  for (const photo of photos) {
+    const score = scorePhoto(photo, pageKeywords, articleKeywords);
+    if (score > bestScore) {
+      bestScore = score;
+      best = photo;
+    }
+  }
+  return best;
+}
+
+async function fetchPexelsImage(prompt: string, topic: string) {
+  const apiKey = getOptionalEnvValue("PEXELS_API_KEY");
+  if (!apiKey) return { result: null, error: "missing-pexels-key" };
+
+  const pageKeywords = extractKeywords(prompt, 4);
+  const articleKeywords = extractKeywords(topic, 3);
+
+  // Combined query = whole-article topic + this page's specifics.
+  const combined: string[] = [];
+  for (const keyword of [
+    articleKeywords[0],
+    ...pageKeywords.slice(0, 3),
+    articleKeywords[1],
+  ]) {
+    if (keyword && !combined.includes(keyword)) combined.push(keyword);
+  }
+
+  // Try the combined query first, then progressively broader fallbacks.
+  const queries = [
+    combined.join(" "),
+    pageKeywords.join(" "),
+    articleKeywords.join(" "),
+    "abstract background",
+  ].filter((query, index, all) => query && all.indexOf(query) === index);
+
+  for (const query of queries) {
+    const photos = await searchPexels(apiKey, query);
+    if (!photos || photos.length === 0) continue;
+
+    const best = pickBestPhoto(photos, pageKeywords, articleKeywords) ?? photos[0];
+    const photoUrl =
+      best.src?.large2x ?? best.src?.portrait ?? best.src?.large ?? best.src?.original;
+    if (!photoUrl) continue;
+
+    const result = await fetchAsImage(photoUrl, {
+      headers: { Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8" },
+      label: `pexels(${query})`,
+      timeoutMs: PEXELS_TIMEOUT_MS,
+    });
+
+    if (result) {
+      console.log(`[image] pexels picked best match for query "${query}"`);
+      return { result, error: undefined as string | undefined };
+    }
+  }
+
+  console.error(
+    `[image] pexels: no usable photo (page=[${pageKeywords.join(",")}] topic=[${articleKeywords.join(",")}])`,
+  );
+  return { result: null, error: "pexels-no-results" };
 }
 
 function hashString(value: string) {
@@ -289,16 +333,19 @@ function imageResponse(buffer: ArrayBuffer, contentType: string, source: string)
   });
 }
 
-// Fallback SVG: DO NOT cache. Previously this was cached for an hour, so the first
-// failure froze the slide as a gradient even after Pollinations recovered. With
-// no-store, the next page load retries the real generation.
-function fallbackResponse(prompt: string) {
+// Fallback SVG: DO NOT cache. If a Pexels lookup failed transiently, no-store
+// lets the next page load retry the real photo search instead of freezing the
+// slide on the gradient placeholder.
+function fallbackResponse(prompt: string, reason = "unknown") {
   return new NextResponse(fallbackSvg(prompt), {
     headers: {
       "Content-Type": "image/svg+xml; charset=utf-8",
       "Cache-Control": "no-store",
       "Access-Control-Allow-Origin": "*",
       "X-Image-Source": "fallback-svg",
+      // Inspect this header in the browser Network tab to see why a slide
+      // fell back to the gradient instead of a generated image.
+      "X-Image-Fallback-Reason": reason,
     },
   });
 }
@@ -306,39 +353,17 @@ function fallbackResponse(prompt: string) {
 export async function GET(request: NextRequest) {
   const rawUrl = request.nextUrl.searchParams.get("url") ?? "";
   const prompt = extractPrompt(rawUrl);
+  const topic = extractTopic(rawUrl);
 
-  // Generated backgrounds (or empty url) -> Hugging Face first, then Pollinations,
-  // then the local SVG only as a last-resort placeholder.
+  // Backgrounds (or empty url) -> search Pexels for a real, topic-relevant
+  // photo (no AI image generation). Local procedural SVG only as a last resort.
   if (!rawUrl || rawUrl.startsWith("instapost-generated://")) {
-    const hfResult = await fetchHuggingFaceImage(prompt);
-    if (hfResult) {
-      return imageResponse(hfResult.buffer, hfResult.contentType, "huggingface");
-    }
-    console.error("[image] huggingface image generation failed");
-
-    const seed = promptSeed(prompt);
-    const headers = pollinationsHeaders();
-
-    // Try best-quality first, then a faster model, then the SVG.
-    const attempts = [
-      { model: "flux", enhance: true, timeoutMs: PRIMARY_TIMEOUT_MS },
-      { model: "turbo", enhance: false, timeoutMs: RETRY_TIMEOUT_MS },
-    ];
-
-    for (const attempt of attempts) {
-      const url = buildPollinationsUrl(prompt, {
-        model: attempt.model,
-        enhance: attempt.enhance,
-        seed,
-      });
-      const result = await fetchAsImage(url, { headers, timeoutMs: attempt.timeoutMs });
-      if (result) {
-        return imageResponse(result.buffer, result.contentType, `pollinations-${attempt.model}`);
-      }
-      console.error(`[image] pollinations attempt failed: model=${attempt.model}`);
+    const pexels = await fetchPexelsImage(prompt, topic);
+    if (pexels.result) {
+      return imageResponse(pexels.result.buffer, pexels.result.contentType, "pexels");
     }
 
-    return fallbackResponse(prompt);
+    return fallbackResponse(prompt, pexels.error);
   }
 
   // Pass-through for real http(s) image URLs.

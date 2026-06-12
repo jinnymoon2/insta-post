@@ -29,6 +29,7 @@ type GenerateResponse = {
 
 const PAGE_WIDTH = 1080;
 const PAGE_HEIGHT = 1350;
+const PAGE_COUNT_OPTIONS = Array.from({ length: 10 }, (_, index) => index + 1);
 
 export default function Home() {
   const [inputMode, setInputMode] = useState<InputMode>("url");
@@ -111,7 +112,10 @@ export default function Home() {
 
   function slideBackgroundProxiedUrl(slide: GeneratedSlide, index: number) {
     const imageUrl = slide.imageUrl ?? "";
-    if (!failedBackgrounds.has(index) && /^https?:\/\//.test(imageUrl)) {
+    // Use the server-provided URL as-is. It carries the page prompt AND the
+    // whole-article topic (?topic=...) the image route needs to combine when
+    // searching for a background; rebuilding it here would drop the topic.
+    if (!failedBackgrounds.has(index) && imageUrl) {
       return proxiedImageUrl(imageUrl);
     }
     return proxiedImageUrl(fallbackImageUrl(slide, index));
@@ -125,29 +129,40 @@ export default function Home() {
 
     let cancelled = false;
 
-    async function resolveAll() {
-      const entries = await Promise.all(
-        slides.map(async (slide, index) => {
-          const proxiedUrl = slideBackgroundProxiedUrl(slide, index);
-          try {
-            const res = await fetch(proxiedUrl);
-            if (!res.ok) throw new Error("fetch failed");
-            const blob = await res.blob();
-            return new Promise<[number, string]>((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve([index, reader.result as string]);
-              reader.onerror = reject;
-              reader.readAsDataURL(blob);
-            });
-          } catch {
-            // Return empty string; the <img> tag will handle its own onError fallback
-            return [index, ""] as [number, string];
-          }
-        }),
-      );
+    async function resolveOne(slide: GeneratedSlide, index: number): Promise<[number, string]> {
+      const proxiedUrl = slideBackgroundProxiedUrl(slide, index);
+      try {
+        const res = await fetch(proxiedUrl);
+        if (!res.ok) throw new Error("fetch failed");
+        const blob = await res.blob();
+        return await new Promise<[number, string]>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve([index, reader.result as string]);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+      } catch {
+        // Empty string -> the <img> tag handles its own onError fallback.
+        return [index, ""];
+      }
+    }
 
-      if (!cancelled) {
-        setResolvedBgUrls(new Map(entries.filter(([, v]) => v !== "")));
+    // Fetch backgrounds ONE AT A TIME. The free image provider allows only a
+    // single in-flight request per IP, so parallel fetches get rejected with
+    // "queue full". Resolve each slide as it arrives so images appear
+    // progressively instead of all at the end.
+    async function resolveAll() {
+      for (let index = 0; index < slides.length; index += 1) {
+        if (cancelled) return;
+        const [, dataUrl] = await resolveOne(slides[index], index);
+        if (cancelled) return;
+        if (dataUrl) {
+          setResolvedBgUrls((current) => {
+            const next = new Map(current);
+            next.set(index, dataUrl);
+            return next;
+          });
+        }
       }
     }
 
@@ -387,18 +402,17 @@ export default function Home() {
                 <span className="mb-2 block text-sm font-bold text-neutral-200">
                   Pages
                 </span>
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
+                <select
                   value={pageCount}
-                  onChange={(event) =>
-                    setPageCount(
-                      Math.min(10, Math.max(1, Math.floor(Number(event.target.value) || 1))),
-                    )
-                  }
+                  onChange={(event) => setPageCount(Number(event.target.value))}
                   className="w-full rounded-xl border border-white/10 bg-neutral-950 px-4 py-3 text-white outline-none focus:border-sky-200"
-                />
+                >
+                  {PAGE_COUNT_OPTIONS.map((count) => (
+                    <option key={count} value={count}>
+                      {count} {count === 1 ? "page" : "pages"}
+                    </option>
+                  ))}
+                </select>
               </label>
             </div>
 
@@ -462,7 +476,11 @@ export default function Home() {
             <div className="grid gap-6 md:grid-cols-2">
               {slides.map((slide, index) => {
                 const fittedSlide = getFittedSlide(slide);
-                const bgUrl = resolvedBgUrls.get(index) || slideBackgroundProxiedUrl(slide, index);
+                // Only the data URI resolved sequentially in resolveAll is used
+                // as the <img> src. We deliberately do NOT point the <img> at the
+                // /api/image route directly: that would make every slide fetch in
+                // parallel and trip the image provider's 1-request-per-IP limit.
+                const bgUrl = resolvedBgUrls.get(index) ?? "";
 
                 return (
                   <article key={`${fittedSlide.title}-${index}`} className="grid gap-3">
@@ -472,19 +490,18 @@ export default function Home() {
                       }}
                       className="relative aspect-[4/5] w-full overflow-hidden bg-neutral-900 shadow-2xl shadow-black/50"
                     >
-                      <img
-                        alt=""
-                        aria-hidden="true"
-                        className="absolute inset-0 h-full w-full scale-[1.03] object-cover"
-                        src={bgUrl}
-                        onError={() => {
-                          setFailedBackgrounds((current) => {
-                            const next = new Set(current);
-                            next.add(index);
-                            return next;
-                          });
-                        }}
-                      />
+                      {bgUrl ? (
+                        <img
+                          alt=""
+                          aria-hidden="true"
+                          className="absolute inset-0 h-full w-full scale-[1.03] object-cover"
+                          src={bgUrl}
+                        />
+                      ) : (
+                        <div className="absolute inset-0 flex items-center justify-center bg-neutral-900 text-xs font-bold text-neutral-500">
+                          Generating background…
+                        </div>
+                      )}
                       <div className="absolute inset-0 bg-gradient-to-b from-black/0 via-black/10 to-black/78" />
                       <div className="absolute inset-x-0 bottom-0 h-[48%] bg-gradient-to-t from-black/70 via-black/30 to-transparent" />
 

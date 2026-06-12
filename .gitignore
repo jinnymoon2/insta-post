@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# FUSE temp files (deleted-but-open on mounted folders)
+.fuse_hidden*
