@@ -3,11 +3,11 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "InstaPost",
-  description: "Generate Instagram carousel posts from links or long writing."
+  description: "Generate Instagram carousel posts from links or long writing.",
 };
 
 export default function RootLayout({
-  children
+  children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {

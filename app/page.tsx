@@ -4,11 +4,11 @@ import { saveAs } from "file-saver";
 import { toPng } from "html-to-image";
 import jsPDF from "jspdf";
 import JSZip from "jszip";
-import Image from "next/image";
 import type { CSSProperties } from "react";
-import { useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type InputMode = "url" | "text";
+type OutputLanguage = "en" | "ko";
 
 type GeneratedSlide = {
   title?: string;
@@ -18,39 +18,58 @@ type GeneratedSlide = {
   imageUrl?: string;
 };
 
+type GenerateResponse = {
+  slides?: GeneratedSlide[];
+  error?: string;
+  meta?: {
+    mode?: string;
+    warning?: string;
+  };
+};
+
+const PAGE_WIDTH = 1080;
+const PAGE_HEIGHT = 1350;
+
 export default function Home() {
   const [inputMode, setInputMode] = useState<InputMode>("url");
   const [url, setUrl] = useState("");
   const [articleText, setArticleText] = useState("");
-  const [language, setLanguage] = useState("en");
+  const [language, setLanguage] = useState<OutputLanguage>("en");
   const [pageCount, setPageCount] = useState(6);
   const [slides, setSlides] = useState<GeneratedSlide[]>([]);
-  const [rawResult, setRawResult] = useState("");
+  const [generationMode, setGenerationMode] = useState("");
+  const [warning, setWarning] = useState("");
   const [loading, setLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
-  const [failedBackgrounds, setFailedBackgrounds] = useState<Set<number>>(
-    new Set(),
-  );
+  const [failedBackgrounds, setFailedBackgrounds] = useState<Set<number>>(new Set());
+  // Stores base64 data: URIs so html-to-image can capture them without re-fetching
+  const [resolvedBgUrls, setResolvedBgUrls] = useState<Map<number, string>>(new Map());
   const slideRefs = useRef<Array<HTMLDivElement | null>>([]);
 
-  const canGenerate =
-    inputMode === "url" ? url.trim().length > 0 : articleText.trim().length >= 80;
+  const canGenerate = useMemo(() => {
+    if (loading) return false;
+    return inputMode === "url" ? url.trim().length > 0 : articleText.trim().length >= 80;
+  }, [articleText, inputMode, loading, url]);
+
+  function resetResultState() {
+    setError("");
+    setWarning("");
+    setGenerationMode("");
+    setSlides([]);
+    setFailedBackgrounds(new Set());
+    setResolvedBgUrls(new Map());
+    slideRefs.current = [];
+  }
 
   async function handleGenerate() {
     setLoading(true);
-    setError("");
-    setSlides([]);
-    setRawResult("");
-    setFailedBackgrounds(new Set());
-    slideRefs.current = [];
+    resetResultState();
 
     try {
       const response = await fetch("/api/generate", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           url: inputMode === "url" ? url : "",
           articleText: inputMode === "text" ? articleText : "",
@@ -59,17 +78,19 @@ export default function Home() {
         }),
       });
 
-      const data = await response.json();
+      const data = (await response.json()) as GenerateResponse;
 
       if (!response.ok) {
         throw new Error(data.error || "Failed to generate post.");
       }
 
-      if (Array.isArray(data.slides)) {
-        setSlides(data.slides);
-      } else {
-        setRawResult(JSON.stringify(data, null, 2));
+      if (!Array.isArray(data.slides) || data.slides.length === 0) {
+        throw new Error("The server did not return any slides.");
       }
+
+      setSlides(data.slides);
+      setGenerationMode(data.meta?.mode ?? "generated");
+      setWarning(data.meta?.warning ?? "");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong.");
     } finally {
@@ -82,36 +103,85 @@ export default function Home() {
   }
 
   function fallbackImageUrl(slide: GeneratedSlide, index: number) {
-    const prompt =
-      slide.imagePrompt || `${slide.title ?? ""} ${slide.text ?? ""}`.trim();
-
+    const prompt = slide.imagePrompt || `${slide.title ?? ""} ${slide.text ?? ""}`.trim();
     return `instapost-generated://slide-${index + 1}/${encodeURIComponent(
       prompt || `carousel page ${index + 1}`,
     )}`;
   }
 
-  function slideBackgroundUrl(slide: GeneratedSlide, index: number) {
+  function slideBackgroundProxiedUrl(slide: GeneratedSlide, index: number) {
     const imageUrl = slide.imageUrl ?? "";
-
     if (!failedBackgrounds.has(index) && /^https?:\/\//.test(imageUrl)) {
-      return imageUrl;
+      return proxiedImageUrl(imageUrl);
     }
-
-    return proxiedImageUrl(
-      failedBackgrounds.has(index) || !imageUrl
-        ? fallbackImageUrl(slide, index)
-        : imageUrl,
-    );
+    return proxiedImageUrl(fallbackImageUrl(slide, index));
   }
 
-  function slideFallbackBackgroundStyle(
-    slide: GeneratedSlide,
-    index: number,
-  ): CSSProperties {
+  // Pre-fetch backgrounds as base64 data URIs whenever slides or failedBackgrounds change.
+  // This is what makes html-to-image work — it reads img.src at capture time and needs
+  // a data: URI rather than a relative URL pointing to a server route.
+  useEffect(() => {
+    if (slides.length === 0) return;
+
+    let cancelled = false;
+
+    async function resolveAll() {
+      const entries = await Promise.all(
+        slides.map(async (slide, index) => {
+          const proxiedUrl = slideBackgroundProxiedUrl(slide, index);
+          try {
+            const res = await fetch(proxiedUrl);
+            if (!res.ok) throw new Error("fetch failed");
+            const blob = await res.blob();
+            return new Promise<[number, string]>((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve([index, reader.result as string]);
+              reader.onerror = reject;
+              reader.readAsDataURL(blob);
+            });
+          } catch {
+            // Return empty string; the <img> tag will handle its own onError fallback
+            return [index, ""] as [number, string];
+          }
+        }),
+      );
+
+      if (!cancelled) {
+        setResolvedBgUrls(new Map(entries.filter(([, v]) => v !== "")));
+      }
+    }
+
+    void resolveAll();
+
+    return () => {
+      cancelled = true;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slides, failedBackgrounds]);
+
+  function hasCjkText(value: string) {
+    return /[가-힣一-龥ぁ-んァ-ン]/.test(value);
+  }
+
+  function truncateText(value: string | undefined, maxLength: number) {
+    const cleaned = (value ?? "").replace(/\s+/g, " ").trim();
+    if (cleaned.length <= maxLength) return cleaned;
+    const sliced = cleaned.slice(0, Math.max(0, maxLength - 1)).trim();
+    const lastSpace = sliced.lastIndexOf(" ");
+    const shouldCutAtWord = lastSpace > maxLength * 0.62 && !hasCjkText(cleaned);
+    return `${shouldCutAtWord ? sliced.slice(0, lastSpace) : sliced}…`;
+  }
+
+  function getFittedSlide(slide: GeneratedSlide): Required<GeneratedSlide> {
+    const rawTitle = slide.title ?? "";
+    const rawText = slide.text ?? "";
+    const isCjk = hasCjkText(`${rawTitle} ${rawText}`);
     return {
-      backgroundImage: `url("${proxiedImageUrl(fallbackImageUrl(slide, index))}")`,
-      backgroundPosition: "center",
-      backgroundSize: "cover",
+      title: truncateText(rawTitle, isCjk ? 30 : 58),
+      text: truncateText(rawText, isCjk ? 108 : 184),
+      caption: slide.caption ?? "",
+      imagePrompt: slide.imagePrompt ?? "",
+      imageUrl: slide.imageUrl ?? "",
     };
   }
 
@@ -120,43 +190,51 @@ export default function Home() {
     const textLength = slide.text?.length ?? 0;
     const longestWord = Math.max(
       0,
-      ...`${slide.title ?? ""} ${slide.text ?? ""}`
-        .split(/\s+/)
-        .map((word) => word.length),
+      ...`${slide.title ?? ""} ${slide.text ?? ""}`.split(/\s+/).map((w) => w.length),
     );
-    const titleSize = Math.max(34, Math.min(60, 62 - titleLength * 0.2));
+    const totalLength = titleLength + textLength;
+    const hasCjk = hasCjkText(`${slide.title ?? ""} ${slide.text ?? ""}`);
+
+    const titleSize = Math.max(
+      hasCjk ? 33 : 34,
+      Math.min(hasCjk ? 56 : 60, 60 - titleLength * (hasCjk ? 0.48 : 0.38)),
+    );
     const textSize = Math.max(
-      25,
-      Math.min(42, 44 - textLength * 0.08 - longestWord * 0.18),
+      hasCjk ? 24 : 22,
+      Math.min(
+        hasCjk ? 36 : 35,
+        37 - textLength * (hasCjk ? 0.07 : 0.055) - longestWord * 0.12 - totalLength * 0.01,
+      ),
     );
 
     return {
       "--title-size": `${titleSize}px`,
       "--text-size": `${textSize}px`,
+      overflowWrap: "anywhere",
+      wordBreak: hasCjk ? "keep-all" : "break-word",
+      hyphens: "auto",
     } as CSSProperties;
   }
 
   async function getSlidePng(index: number) {
     const node = slideRefs.current[index];
-
-    if (!node) {
-      throw new Error(`Page ${index + 1} is not ready yet.`);
-    }
+    if (!node) throw new Error(`Page ${index + 1} is not ready yet.`);
 
     return toPng(node, {
       cacheBust: true,
       pixelRatio: 2,
       backgroundColor: "#000000",
-      width: 1080,
-      height: 1350,
+      width: PAGE_WIDTH,
+      height: PAGE_HEIGHT,
       style: {
-        width: "1080px",
-        height: "1350px",
+        width: `${PAGE_WIDTH}px`,
+        height: `${PAGE_HEIGHT}px`,
       },
     });
   }
 
   async function downloadOne(index: number) {
+    setError("");
     try {
       const png = await getSlidePng(index);
       const link = document.createElement("a");
@@ -170,13 +248,10 @@ export default function Home() {
 
   async function downloadAllPngs() {
     if (slides.length === 0) return;
-
     setDownloading(true);
     setError("");
-
     try {
       const zip = new JSZip();
-
       for (let index = 0; index < slides.length; index += 1) {
         const png = await getSlidePng(index);
         zip.file(
@@ -197,26 +272,22 @@ export default function Home() {
 
   async function downloadPdf() {
     if (slides.length === 0) return;
-
     setDownloading(true);
     setError("");
-
     try {
       const pdf = new jsPDF({
         orientation: "portrait",
         unit: "px",
-        format: [1080, 1350],
+        format: [PAGE_WIDTH, PAGE_HEIGHT],
         compress: true,
       });
 
       for (let index = 0; index < slides.length; index += 1) {
         const png = await getSlidePng(index);
-
         if (index > 0) {
-          pdf.addPage([1080, 1350], "portrait");
+          pdf.addPage([PAGE_WIDTH, PAGE_HEIGHT], "portrait");
         }
-
-        pdf.addImage(png, "PNG", 0, 0, 1080, 1350);
+        pdf.addImage(png, "PNG", 0, 0, PAGE_WIDTH, PAGE_HEIGHT);
       }
 
       pdf.save("instapost-carousel.pdf");
@@ -228,19 +299,19 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-[#080b10] px-5 py-8 text-white md:px-8">
+    <main className="min-h-screen px-5 py-8 text-white md:px-8">
       <div className="mx-auto max-w-6xl">
         <section className="mb-8 grid gap-8 lg:grid-cols-[1fr_440px] lg:items-start">
           <div className="pt-4">
-            <p className="mb-3 text-xs font-black uppercase tracking-[0.22em] text-sky-200">
+            <p className="mb-3 text-xs font-black uppercase text-sky-200">
               Instagram Carousel Generator
             </p>
-            <h1 className="max-w-3xl text-5xl font-black leading-none tracking-tight md:text-6xl">
+            <h1 className="max-w-3xl text-5xl font-black leading-none md:text-6xl">
               Turn writing into Instagram-ready posts.
             </h1>
             <p className="mt-5 max-w-2xl text-lg leading-8 text-neutral-300">
-              Generate square-free 4:5 carousel pages with unique backgrounds,
-              summary copy, PNG downloads, and a PDF export.
+              Generate 4:5 carousel pages with contextual backgrounds, short
+              summaries, PNG downloads, and a PDF export.
             </p>
           </div>
 
@@ -304,13 +375,11 @@ export default function Home() {
                 </span>
                 <select
                   value={language}
-                  onChange={(event) => setLanguage(event.target.value)}
+                  onChange={(event) => setLanguage(event.target.value as OutputLanguage)}
                   className="w-full rounded-xl border border-white/10 bg-neutral-950 px-4 py-3 text-white outline-none focus:border-sky-200"
                 >
                   <option value="en">English</option>
                   <option value="ko">Korean</option>
-                  <option value="ja">Japanese</option>
-                  <option value="zh">Chinese</option>
                 </select>
               </label>
 
@@ -325,10 +394,7 @@ export default function Home() {
                   value={pageCount}
                   onChange={(event) =>
                     setPageCount(
-                      Math.min(
-                        10,
-                        Math.max(1, Math.floor(Number(event.target.value))),
-                      ),
+                      Math.min(10, Math.max(1, Math.floor(Number(event.target.value) || 1))),
                     )
                   }
                   className="w-full rounded-xl border border-white/10 bg-neutral-950 px-4 py-3 text-white outline-none focus:border-sky-200"
@@ -339,14 +405,24 @@ export default function Home() {
             <button
               type="button"
               onClick={handleGenerate}
-              disabled={loading || !canGenerate}
-              className="w-full rounded-xl bg-gradient-to-r from-sky-200 to-blue-300 px-5 py-3 font-black text-neutral-950 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={!canGenerate}
+              className="w-full rounded-xl bg-sky-200 px-5 py-3 font-black text-neutral-950 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {loading ? "Generating..." : "Generate"}
             </button>
 
+            {generationMode ? (
+              <p className="mt-4 text-sm text-neutral-300">Mode: {generationMode}</p>
+            ) : null}
+
+            {warning ? (
+              <div className="mt-4 rounded-xl border border-yellow-400/30 bg-yellow-950/50 px-4 py-3 text-sm text-yellow-100">
+                {warning}
+              </div>
+            ) : null}
+
             {error ? (
-              <div className="mt-5 rounded-xl border border-red-500/30 bg-red-950/70 px-4 py-3 text-sm text-red-100">
+              <div className="mt-4 rounded-xl border border-red-500/30 bg-red-950/70 px-4 py-3 text-sm text-red-100">
                 {error}
               </div>
             ) : null}
@@ -357,7 +433,7 @@ export default function Home() {
           <section className="mt-10">
             <div className="mb-5 flex flex-col justify-between gap-4 md:flex-row md:items-end">
               <div>
-                <p className="mb-2 text-xs font-black uppercase tracking-[0.2em] text-sky-200">
+                <p className="mb-2 text-xs font-black uppercase text-sky-200">
                   Generated Carousel
                 </p>
                 <h2 className="text-3xl font-black">Instagram post pages</h2>
@@ -384,65 +460,58 @@ export default function Home() {
             </div>
 
             <div className="grid gap-6 md:grid-cols-2">
-              {slides.map((slide, index) => (
-                <article key={`${slide.title}-${index}`} className="grid gap-3">
-                  <div
-                    ref={(element) => {
-                      slideRefs.current[index] = element;
-                    }}
-                    className="relative aspect-[4/5] w-full overflow-hidden bg-neutral-900 shadow-2xl shadow-black/50"
-                    style={slideFallbackBackgroundStyle(slide, index)}
-                  >
-                    <Image
-                      alt=""
-                      aria-hidden="true"
-                      fill
-                      unoptimized
-                      className="scale-[1.03] object-cover"
-                      src={slideBackgroundUrl(slide, index)}
-                      onError={() => {
-                        setFailedBackgrounds((current) => {
-                          const next = new Set(current);
-                          next.add(index);
-                          return next;
-                        });
-                      }}
-                    />
-                    <div className="absolute inset-0 bg-gradient-to-b from-black/0 via-black/10 to-black/78" />
-                    <div className="absolute inset-x-0 bottom-0 h-[48%] bg-gradient-to-t from-black/70 via-black/30 to-transparent" />
+              {slides.map((slide, index) => {
+                const fittedSlide = getFittedSlide(slide);
+                const bgUrl = resolvedBgUrls.get(index) || slideBackgroundProxiedUrl(slide, index);
 
+                return (
+                  <article key={`${fittedSlide.title}-${index}`} className="grid gap-3">
                     <div
-                      className="absolute bottom-[10%] left-[6%] right-[6%] max-h-[58%] overflow-hidden"
-                      style={getSlideTextStyle(slide)}
+                      ref={(element) => {
+                        slideRefs.current[index] = element;
+                      }}
+                      className="relative aspect-[4/5] w-full overflow-hidden bg-neutral-900 shadow-2xl shadow-black/50"
                     >
-                      <h3 className="mb-7 text-[length:var(--title-size)] font-black leading-[1.08] tracking-[-0.01em] text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.65)] [overflow-wrap:anywhere]">
-                        {slide.title}
-                      </h3>
-                      <p className="whitespace-pre-wrap text-[length:var(--text-size)] font-black leading-[1.24] tracking-[-0.005em] text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.65)] [overflow-wrap:anywhere]">
-                        {slide.text}
-                      </p>
+                      <img
+                        alt=""
+                        aria-hidden="true"
+                        className="absolute inset-0 h-full w-full scale-[1.03] object-cover"
+                        src={bgUrl}
+                        onError={() => {
+                          setFailedBackgrounds((current) => {
+                            const next = new Set(current);
+                            next.add(index);
+                            return next;
+                          });
+                        }}
+                      />
+                      <div className="absolute inset-0 bg-gradient-to-b from-black/0 via-black/10 to-black/78" />
+                      <div className="absolute inset-x-0 bottom-0 h-[48%] bg-gradient-to-t from-black/70 via-black/30 to-transparent" />
+
+                      <div
+                        className="absolute bottom-[10%] left-[6%] right-[6%] max-h-[58%] overflow-hidden"
+                        style={getSlideTextStyle(fittedSlide)}
+                      >
+                        <h3 className="mb-7 text-[length:var(--title-size)] font-black leading-[1.08] text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.65)]">
+                          {fittedSlide.title}
+                        </h3>
+                        <p className="whitespace-pre-wrap text-[length:var(--text-size)] font-black leading-[1.24] text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.65)]">
+                          {fittedSlide.text}
+                        </p>
+                      </div>
                     </div>
-                  </div>
 
-                  <button
-                    type="button"
-                    onClick={() => downloadOne(index)}
-                    className="rounded-xl bg-sky-200 px-4 py-3 font-black text-neutral-950"
-                  >
-                    Download Page {index + 1}
-                  </button>
-                </article>
-              ))}
+                    <button
+                      type="button"
+                      onClick={() => downloadOne(index)}
+                      className="rounded-xl bg-sky-200 px-4 py-3 font-black text-neutral-950"
+                    >
+                      Download Page {index + 1}
+                    </button>
+                  </article>
+                );
+              })}
             </div>
-          </section>
-        ) : null}
-
-        {rawResult ? (
-          <section className="mt-10">
-            <h2 className="mb-4 text-2xl font-bold">Generated Result</h2>
-            <pre className="overflow-x-auto rounded-2xl border border-neutral-800 bg-neutral-900 p-5 text-sm text-neutral-200">
-              {rawResult}
-            </pre>
           </section>
         ) : null}
       </div>

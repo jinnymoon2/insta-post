@@ -1,39 +1,118 @@
+import { NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const ROUTE_VERSION = "generate-route-web-backgrounds-v4";
-
+const ROUTE_VERSION = "generate-route-source-first-v4";
+const HF_CHAT_COMPLETIONS_URL = "https://router.huggingface.co/v1/chat/completions";
+const MAX_ARTICLE_CHARS = 12000;
+const MIN_TEXT_INPUT_LENGTH = 80;
+const MIN_ARTICLE_LENGTH = 180;
+type OutputLanguage = "en" | "ko";
+type ChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
 type GeneratedSlide = {
   title: string;
   text: string;
   imagePrompt: string;
   imageUrl: string;
 };
-
-type GeneratedResponse = {
-  slides: GeneratedSlide[];
+type ModelSlide = {
+  title?: unknown;
+  text?: unknown;
+  imagePrompt?: unknown;
 };
-
-type WikimediaPage = {
-  imageinfo?: Array<{
-    mime?: string;
-    thumburl?: string;
-    url?: string;
-  }>;
+type GenerateRequestBody = {
+  url?: unknown;
+  articleText?: unknown;
+  language?: unknown;
+  pageCount?: unknown;
 };
-
-function getEnvValue(name: string) {
-  const value = process.env[name];
-
-  if (!value) {
-    throw new Error(`Missing ${name} in .env.local.`);
-  }
-
-  return value;
+function clampPageCount(value: unknown) {
+  const requestedPageCount = Number(value);
+  if (!Number.isFinite(requestedPageCount)) return 6;
+  return Math.min(Math.max(Math.floor(requestedPageCount), 1), 10);
 }
-
+function normalizeLanguage(value: unknown): OutputLanguage {
+  return value === "ko" ? "ko" : "en";
+}
+function getOptionalEnvValue(name: string) {
+  return process.env[name]?.trim() ?? "";
+}
+function getHFToken() {
+  const token = getOptionalEnvValue("HF_TOKEN");
+  if (!token) {
+    throw new Error(
+      "Missing HF_TOKEN. Add HF_TOKEN=hf_your_token_here to .env.local, then stop and restart npm run dev.",
+    );
+  }
+  if (!token.startsWith("hf_")) {
+    throw new Error(
+      "Invalid HF_TOKEN format. Hugging Face tokens usually start with hf_. Check .env.local.",
+    );
+  }
+  return token;
+}
+function safeErrorMessage(error: unknown) {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+function decodeHtmlEntities(value: string) {
+  return value
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, "/");
+}
+function stripHtml(html: string) {
+  const withoutNoise = html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<header[\s\S]*?<\/header>/gi, " ")
+    .replace(/<aside[\s\S]*?<\/aside>/gi, " ");
+  const articleMatch = withoutNoise.match(/<article[\s\S]*?<\/article>/i);
+  const mainMatch = withoutNoise.match(/<main[\s\S]*?<\/main>/i);
+  const bestBlock = articleMatch?.[0] ?? mainMatch?.[0] ?? withoutNoise;
+  const paragraphs = Array.from(bestBlock.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi))
+    .map((match) => match[1].replace(/<[^>]+>/g, " "))
+    .map(decodeHtmlEntities)
+    .map((text) => text.replace(/\s+/g, " ").trim())
+    .filter((text) => text.length >= 40)
+    .filter(
+      (text) =>
+        !/cookie|privacy policy|subscribe|newsletter|advertisement|sign up|log in/i.test(text),
+    );
+  const paragraphText = paragraphs.join(" ").trim();
+  if (paragraphText.length >= 400) return paragraphText;
+  return decodeHtmlEntities(bestBlock.replace(/<[^>]+>/g, " "))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function normalizeUrl(input: string) {
+  try {
+    const parsed = new URL(input);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      throw new Error("Only http and https URLs are supported.");
+    }
+    return parsed.toString();
+  } catch {
+    throw new Error("Please enter a valid article URL, or use Long Text mode.");
+  }
+}
 async function fetchArticle(url: string) {
-  const response = await fetch(url, {
+  if (!url) {
+    throw new Error("Please enter an article URL or paste article text.");
+  }
+  const articleUrl = normalizeUrl(url);
+  const response = await fetch(articleUrl, {
     method: "GET",
     headers: {
       "User-Agent":
@@ -42,810 +121,424 @@ async function fetchArticle(url: string) {
         "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
     },
     cache: "no-store",
+    signal: AbortSignal.timeout(20000),
   });
-
   if (!response.ok) {
-    throw new Error(`Could not fetch article. Status: ${response.status}`);
+    throw new Error(
+      `Could not fetch article. Status: ${response.status}. This site may block server fetching. Paste the article text manually instead.`,
+    );
   }
-
   const html = await response.text();
-
-  const cleanedText = html
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<nav[\s\S]*?<\/nav>/gi, "")
-    .replace(/<footer[\s\S]*?<\/footer>/gi, "")
-    .replace(/<header[\s\S]*?<\/header>/gi, "")
-    .replace(/<aside[\s\S]*?<\/aside>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!cleanedText || cleanedText.length < 200) {
-    throw new Error("Could not extract enough article text.");
+  const cleanedText = stripHtml(html);
+  if (!cleanedText || cleanedText.length < MIN_ARTICLE_LENGTH) {
+    throw new Error(
+      "Could not extract enough article text. Paste the article text manually instead.",
+    );
   }
-
-  return cleanedText.slice(0, 12000);
+  return cleanedText.slice(0, MAX_ARTICLE_CHARS);
 }
-
-function getLanguageInstruction(language: string) {
-  if (language === "ko") {
-    return "Write everything in Korean.";
-  }
-
-  if (language === "ja") {
-    return "Write everything in Japanese.";
-  }
-
-  if (language === "zh") {
-    return "Write everything in Chinese.";
-  }
-
-  return "Write everything in English.";
+function detectSourceLanguage(text: string): OutputLanguage {
+  const koreanChars = text.match(/[가-힣]/g)?.length ?? 0;
+  const latinChars = text.match(/[A-Za-z]/g)?.length ?? 0;
+  return koreanChars > latinChars * 0.18 ? "ko" : "en";
 }
-
-function clampPageCount(value: unknown) {
-  const requestedPageCount = Number(value);
-
-  return Number.isFinite(requestedPageCount)
-    ? Math.min(Math.max(Math.floor(requestedPageCount), 1), 10)
-    : 6;
-}
-
 function splitIntoSentences(text: string) {
   return text
     .replace(/\s+/g, " ")
-    .split(/(?<=[.!?。！？다요죠음임까])\s+/)
+    .split(/(?<=[.!?。！？])\s+|(?<=[다요죠음임까])\s+/)
     .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence.length > 24);
+    .filter((sentence) => sentence.length >= 30 && sentence.length <= 500)
+    .filter(
+      (sentence) =>
+        !/cookie|privacy policy|subscribe|newsletter|advertisement|sign up|log in/i.test(
+          sentence,
+        ),
+    )
+    // Skip first-person sentences from the source text
+    .filter(
+      (sentence) =>
+        !/\b(I|we|our|my)\b/i.test(sentence) &&
+        !/우리는|우리가|저는|저희|제가/.test(sentence),
+    );
 }
-
-function limitToTwoSentences(text: string) {
-  const cleaned = text.replace(/\s+/g, " ").trim();
-  const sentences = splitIntoSentences(cleaned);
-
-  if (sentences.length > 0) {
-    return sentences.slice(0, 2).join(" ");
+function compactText(value: string, language: OutputLanguage, kind: "title" | "body") {
+  const cleaned = value.replace(/\s+/g, " ").trim().replace(/^[.,;:!?。！？\s]+/, "");
+  const maxLength =
+    kind === "title" ? (language === "ko" ? 30 : 58) : language === "ko" ? 105 : 180;
+  if (cleaned.length <= maxLength) return cleaned;
+  const sliced = cleaned.slice(0, maxLength - 1).trim();
+  const lastSpace = sliced.lastIndexOf(" ");
+  if (language === "en" && lastSpace > maxLength * 0.62) {
+    return `${sliced.slice(0, lastSpace)}…`;
   }
-
-  return cleaned.slice(0, 220);
+  return `${sliced}…`;
 }
-
-function getFallbackTitle(index: number, language: string) {
-  const englishTitles = [
-    "Core Idea",
-    "Why It Matters",
-    "Key Context",
-    "Main Change",
-    "What To Watch",
-    "Impact",
-    "Next Step",
-    "Big Picture",
-    "Open Question",
-    "Takeaway",
-  ];
-  const koreanTitles = [
-    "핵심 내용",
-    "왜 중요한가",
-    "주요 맥락",
-    "핵심 변화",
-    "눈여겨볼 점",
-    "영향",
-    "다음 단계",
-    "큰 흐름",
-    "남은 질문",
-    "정리",
-  ];
-
-  return language === "ko"
-    ? koreanTitles[index % koreanTitles.length]
-    : englishTitles[index % englishTitles.length];
-}
-
-function hasUnexpectedLatin(text: string) {
-  const allowed = new Set(["AI", "API", "CEO", "SNS", "IT", "Gemini", "ChatGPT"]);
-  const latinWords = text.match(/[A-Za-z][A-Za-z-]{2,}/g) ?? [];
-
-  return latinWords.some((word) => !allowed.has(word));
-}
-
-function cleanTitle(title: string, index: number, language: string) {
-  const cleaned = title.replace(/\s+/g, " ").trim();
-  const maxLength = language === "ko" ? 34 : 58;
-
-  if (!cleaned || cleaned.length > maxLength) {
-    return getFallbackTitle(index, language);
-  }
-
-  if (language === "ko" && hasUnexpectedLatin(cleaned)) {
-    return getFallbackTitle(index, language);
-  }
-
-  return cleaned.replace(/[.!?。！？]+$/g, "");
-}
-
-function cleanBody(text: string, index: number, language: string) {
-  const cleaned = limitToTwoSentences(text);
-
-  if (!cleaned) {
-    return language === "ko"
-      ? "이 페이지는 전체 이야기에서 중요한 흐름과 의미를 짧게 정리합니다."
-      : "This page summarizes one important part of the larger story.";
-  }
-
-  if (language === "ko" && hasUnexpectedLatin(cleaned)) {
-    return "전체 이야기에서 중요한 흐름과 의미를 한눈에 이해할 수 있도록 짧게 정리합니다.";
-  }
-
-  return cleaned;
-}
-
 function extractKeywords(text: string, limit = 5) {
   const stopWords = new Set([
-    "about",
-    "after",
-    "also",
-    "because",
-    "before",
-    "being",
-    "could",
-    "first",
-    "from",
-    "have",
-    "into",
-    "only",
-    "other",
-    "section",
-    "their",
-    "there",
-    "these",
-    "this",
-    "through",
-    "while",
-    "with",
-    "would",
-    "article",
-    "explains",
-    "important",
+    "about", "after", "also", "because", "before", "being", "could", "first",
+    "from", "have", "into", "only", "other", "section", "their", "there",
+    "these", "this", "through", "while", "with", "would", "article",
+    "explains", "important", "overall", "story",
   ]);
   const words =
     text
       .match(/[A-Za-z][A-Za-z0-9-]{3,}|[가-힣]{2,}/g)
       ?.filter((word) => !stopWords.has(word.toLowerCase())) ?? [];
   const counts = new Map<string, { value: string; count: number }>();
-
   for (const word of words) {
     const key = word.toLowerCase();
     const current = counts.get(key);
-    counts.set(key, {
-      value: current?.value ?? word,
-      count: (current?.count ?? 0) + 1,
-    });
+    counts.set(key, { value: current?.value ?? word, count: (current?.count ?? 0) + 1 });
   }
-
   return Array.from(counts.values())
     .sort((a, b) => b.count - a.count || b.value.length - a.value.length)
     .slice(0, limit)
     .map((item) => item.value);
 }
-
 function detectTone(text: string) {
   const lower = text.toLowerCase();
-
-  if (/(risk|crisis|urgent|warning|danger|conflict|threat)/.test(lower)) {
-    return "urgent";
-  }
-
-  if (/(ai|technology|software|computer|device|startup|innovation|robotics)/.test(lower)) {
+  if (/(ai|technology|software|computer|device|startup|innovation|robotics|robot|claude|openai|github|code|developer)/.test(lower))
     return "technology";
-  }
-
-  if (/(climate|energy|solar|wind|battery|earth|ocean|forest|nature)/.test(lower)) {
+  if (/(climate|energy|solar|wind|battery|earth|ocean|forest|nature)/.test(lower))
     return "climate";
-  }
-
-  if (/(school|student|education|learning|research|classroom)/.test(lower)) {
+  if (/(school|student|education|learning|research|classroom|university)/.test(lower))
     return "education";
-  }
-
+  if (/(market|business|company|revenue|startup|customer|product)/.test(lower))
+    return "business";
   return "editorial";
 }
-
 function makeImagePrompt(slideText: string, index: number) {
   const keywords = extractKeywords(slideText, 5);
   const tone = detectTone(slideText);
   const topic = keywords.length > 0 ? keywords.join(", ") : "article summary";
-
-  return `${tone} editorial background for ${topic}, slide ${index + 1}, abstract photographic composition, no text`;
+  return `${tone} editorial photograph for ${topic}, slide ${index + 1}, visually specific scene inspired by this point, cinematic light, layered depth, dark lower area for white text, no text`;
 }
-
 function makeImageUrl(imagePrompt: string, index: number) {
   return `instapost-generated://slide-${index + 1}/${encodeURIComponent(imagePrompt)}`;
 }
-
-function compactSearchQuery(value: string) {
-  return value
-    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
-    .replace(/\b(slide|page|summary|background|editorial|abstract|photo|image)\b/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 140);
+function makeFallbackTitle(index: number, language: OutputLanguage) {
+  return language === "ko" ? `핵심 포인트 ${index + 1}` : `Key Point ${index + 1}`;
 }
-
-function extractSearchPhrases(value: string) {
-  const phraseMatches =
-    value.match(
-      /\b(?:[A-Z][A-Za-z0-9+.-]*|[A-Z]{2,}|\d+[A-Za-z0-9+.-]*)\b(?:\s+\b(?:[A-Z][A-Za-z0-9+.-]*|[A-Z]{2,}|\d+[A-Za-z0-9+.-]*)\b){0,4}/g,
-    ) ?? [];
-
-  return Array.from(
-    new Set(
-      phraseMatches
-        .map((phrase) => phrase.replace(/^(The|A|An)\s+/i, "").trim())
-        .filter((phrase) => phrase.length > 3 && !/^(This|That|With)$/i.test(phrase)),
-    ),
-  ).slice(0, 5);
-}
-
-function getTopicImageQueries(value: string) {
-  const lower = value.toLowerCase();
-  const queries: string[] = [];
-
-  if (/(robot|robots|robotic|robotics|humanoid|automation|factory|manufactur|warehouse)/.test(lower)) {
-    queries.push(
-      "industrial robot factory",
-      "factory automation robot",
-      "robot arm manufacturing",
-      "industrial robot arm",
-      "factory robot arm",
-      "manufacturing robot",
-      "industrial automation robot",
-      "automated factory robot",
-      "collaborative robot manufacturing",
-      "KUKA robot factory",
-      "FANUC industrial robot",
-      "humanoid robot",
-      "warehouse robot",
-    );
-  }
-
-  if (/(raspberry pi|single-board|processor|cpu|usb|computer board|circuit board)/.test(lower)) {
-    queries.push(
-      "Raspberry Pi 5",
-      "Raspberry Pi computer board",
-      "single board computer",
-      "computer processor board",
-    );
-  }
-
-  if (/(ai|artificial intelligence|machine learning|agent|software|startup|technology)/.test(lower)) {
-    queries.push(
-      "artificial intelligence technology",
-      "computer server technology",
-      "software engineering workspace",
-      "machine learning computer",
-    );
-  }
-
-  if (/(resume|job|career|interview|hiring|recruit|workplace)/.test(lower)) {
-    queries.push(
-      "job interview office",
-      "resume career workplace",
-      "office work computer",
-    );
-  }
-
-  return queries;
-}
-
-function buildImageQueries(
-  slide: GeneratedSlide,
-  articleKeywords: string[],
-  article: string,
-) {
-  const slideKeywords = extractKeywords(`${slide.title} ${slide.text}`, 6);
-  const articleTopic = articleKeywords.slice(0, 5).join(" ");
-  const slideTopic = slideKeywords.join(" ");
-  const articlePhrases = extractSearchPhrases(article);
-  const slidePhrases = extractSearchPhrases(`${slide.title} ${slide.text}`);
-  const mainPhrase = articlePhrases[0] ?? articleTopic;
-  const topicQueries = getTopicImageQueries(
-    `${article} ${slide.title} ${slide.text} ${slide.imagePrompt}`,
-  );
-  const tone = detectTone(`${slide.title} ${slide.text} ${articleTopic}`);
-  const contextWord =
-    tone === "technology"
-      ? "computer board technology hardware"
-      : tone === "education"
-        ? "education research"
-        : tone === "climate"
-          ? "nature environment"
-          : "news editorial";
-
-  return Array.from(
-    new Set(
-      [
-        ...topicQueries,
-        ...topicQueries.map((query) => `${query} ${slideKeywords.slice(0, 2).join(" ")}`),
-        mainPhrase,
-        `${mainPhrase} computer board`,
-        `${mainPhrase} ${slideKeywords.slice(0, 2).join(" ")}`,
-        ...articlePhrases.map((phrase) => `${phrase} ${contextWord}`),
-        `${mainPhrase} ${contextWord}`,
-        ...slidePhrases.map((phrase) => `${mainPhrase} ${phrase}`),
-        `${articleKeywords.slice(0, 3).join(" ")} ${contextWord}`,
-        `${slideKeywords.slice(0, 3).join(" ")} ${contextWord}`,
-        `${slideTopic} ${articleKeywords.slice(0, 3).join(" ")}`,
-        `${articleTopic} ${slide.title}`,
-      ]
-        .map(compactSearchQuery)
-        .filter((query) => query.length > 8),
-    ),
-  );
-}
-
-async function getWikimediaImageCandidates(query: string) {
-  const searchParams = new URLSearchParams({
-    action: "query",
-    generator: "search",
-    gsrsearch: query,
-    gsrnamespace: "6",
-    gsrlimit: "50",
-    prop: "imageinfo",
-    iiprop: "url|mime",
-    iiurlwidth: "1400",
-    format: "json",
-    origin: "*",
-  });
-
-  const response = await fetch(
-    `https://commons.wikimedia.org/w/api.php?${searchParams.toString()}`,
-    {
-      headers: {
-        "User-Agent": "InstaPost/1.0 (local carousel image search)",
-      },
-      cache: "no-store",
-      signal: AbortSignal.timeout(5000),
-    },
-  );
-
-  if (!response.ok) {
-    return [];
-  }
-
-  const data = (await response.json()) as {
-    query?: { pages?: Record<string, WikimediaPage> };
-  };
-  const pages = Object.values(data.query?.pages ?? {});
-
-  return pages
-    .map((page) => {
-      const info = page.imageinfo?.[0];
-
-      return {
-        imageUrl: info?.thumburl || info?.url || "",
-        mime: info?.mime ?? "",
-      };
-    })
-    .filter(
-      (candidate) =>
-        candidate.imageUrl && /^image\/(jpeg|png|webp)$/i.test(candidate.mime),
-    )
-    .map((candidate) => candidate.imageUrl);
-}
-
-async function searchWikimediaImage(query: string, usedUrls: Set<string>) {
-  const candidates = await getWikimediaImageCandidates(query);
-
-  for (const imageUrl of candidates) {
-    if (!usedUrls.has(imageUrl)) {
-      usedUrls.add(imageUrl);
-      return imageUrl;
-    }
-  }
-
-  return "";
-}
-
-async function buildCandidateImagePool(
-  queries: string[],
-  usedUrls: Set<string>,
-  maxItems: number,
-) {
-  const pool: string[] = [];
-
-  for (const query of queries) {
-    try {
-      const candidates = await getWikimediaImageCandidates(query);
-
-      for (const imageUrl of candidates) {
-        if (!usedUrls.has(imageUrl) && !pool.includes(imageUrl)) {
-          pool.push(imageUrl);
-
-          if (pool.length >= maxItems) {
-            return pool;
-          }
-        }
-      }
-    } catch (error) {
-      console.error("[image-pool:error]", query, error);
-    }
-  }
-
-  return pool;
-}
-
-async function findInternetImageForSlide(
-  slide: GeneratedSlide,
-  articleKeywords: string[],
-  article: string,
-  usedUrls: Set<string>,
-) {
-  const queries = buildImageQueries(slide, articleKeywords, article);
-
-  for (const query of queries) {
-    try {
-      const imageUrl = await searchWikimediaImage(query, usedUrls);
-
-      if (imageUrl) {
-        return imageUrl;
-      }
-    } catch (error) {
-      console.error("[image-search:error]", query, error);
-    }
-  }
-
-  return "";
-}
-
-async function attachInternetImages(
-  generated: GeneratedResponse,
-  article: string,
-): Promise<GeneratedResponse> {
-  const articleKeywords = extractKeywords(article, 8);
-  const usedUrls = new Set<string>();
-  const broadQueries = Array.from(
-    new Set(
-      [
-        ...getTopicImageQueries(article),
-        `${articleKeywords.slice(0, 3).join(" ")} news editorial`,
-        `${articleKeywords.slice(0, 4).join(" ")}`,
-      ]
-        .map(compactSearchQuery)
-        .filter((query) => query.length > 8),
-    ),
-  );
-  const imagePool = await buildCandidateImagePool(
-    broadQueries,
-    usedUrls,
-    generated.slides.length + 20,
-  );
-  const slides: GeneratedSlide[] = [];
-
-  for (let index = 0; index < generated.slides.length; index += 1) {
-    const slide = generated.slides[index];
-    const internetImageUrl = await findInternetImageForSlide(
-      slide,
-      articleKeywords,
-      article,
-      usedUrls,
-    );
-    const pooledImageUrl = imagePool.find((imageUrl) => !usedUrls.has(imageUrl));
-
-    if (pooledImageUrl) {
-      usedUrls.add(pooledImageUrl);
-    }
-
-    slides.push({
-      ...slide,
-      imageUrl:
-        internetImageUrl ||
-        pooledImageUrl ||
-        slide.imageUrl ||
-        makeImageUrl(slide.imagePrompt, index),
-    });
-  }
-
-  return {
-    slides: slides.map((slide, index) => ({
-      ...slide,
-      imagePrompt:
-        slide.imagePrompt || makeImagePrompt(`${slide.title} ${slide.text}`, index),
-      imageUrl:
-        slide.imageUrl ||
-        makeImageUrl(
-          slide.imagePrompt || makeImagePrompt(`${slide.title} ${slide.text}`, index),
-          index,
-        ),
-    })),
-  };
-}
-
-function summarizeFallback(article: string, pageCount: number, language: string): GeneratedResponse {
-  const sentences = splitIntoSentences(article);
-  const selected = Array.from({ length: pageCount }, (_, index) => {
-    if (sentences.length === 0) return article.slice(0, 220);
-
-    const sentenceIndex =
-      pageCount === 1
-        ? Math.floor(sentences.length / 2)
-        : Math.round((index * (sentences.length - 1)) / Math.max(1, pageCount - 1));
-
-    return sentences[sentenceIndex] ?? sentences[index % sentences.length];
-  });
-
-  const useKorean = language === "ko";
-
-  return {
-    slides: selected.map((sourceText, index) => {
-      const keywords = extractKeywords(sourceText, 4);
-      const topic = keywords.length > 0 ? keywords.join(", ") : "the main point";
-      const text = useKorean
-        ? `${topic}를 중심으로 핵심 내용을 요약하면, 이 부분은 전체 이야기의 흐름과 의미를 보여줍니다.`
-        : `This page summarizes the key point around ${topic} and why it matters in the larger story.`;
-      const imagePrompt = makeImagePrompt(`${topic} ${sourceText}`, index);
-
-      return {
-        title: getFallbackTitle(index, language),
-        text,
-        imagePrompt,
-        imageUrl: makeImageUrl(imagePrompt, index),
-      };
-    }),
-  };
-}
-
-function extractJson(text: string) {
-  const trimmed = text.trim();
-
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
-
-    if (!jsonMatch) {
-      throw new Error("AI response did not contain valid JSON.");
-    }
-
-    return JSON.parse(jsonMatch[0]);
-  }
-}
-
-function normalizeGeneratedResponse(
-  parsed: unknown,
+function makeExtractiveSlides(
+  articleText: string,
   pageCount: number,
-  language: string
-): GeneratedResponse {
-  if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    !("slides" in parsed) ||
-    !Array.isArray((parsed as { slides: unknown }).slides)
-  ) {
-    throw new Error("AI response was missing the slides array.");
-  }
-
-  const slides = (parsed as { slides: unknown[] }).slides
-    .slice(0, pageCount)
-    .map((slide, index) => {
-      if (typeof slide !== "object" || slide === null) {
-        return {
-          title: `Page ${index + 1}`,
-          text: "",
-          imagePrompt: "",
-          imageUrl: "",
-        };
-      }
-
-      const item = slide as {
-        title?: unknown;
-        text?: unknown;
-        imagePrompt?: unknown;
-      };
-
-      return {
-        title:
-          typeof item.title === "string" && item.title.trim()
-            ? cleanTitle(item.title, index, language)
-            : getFallbackTitle(index, language),
-        text:
-          typeof item.text === "string" && item.text.trim()
-            ? cleanBody(item.text, index, language)
-            : cleanBody("", index, language),
-        imagePrompt:
-          typeof item.imagePrompt === "string" && item.imagePrompt.trim()
-            ? item.imagePrompt.trim()
-            : "",
-        imageUrl: "",
-      };
-    })
-    .map((slide, index) => {
-      const imagePrompt =
-        slide.imagePrompt || makeImagePrompt(`${slide.title} ${slide.text}`, index);
-
-      return {
-        ...slide,
-        imagePrompt,
-        imageUrl: makeImageUrl(imagePrompt, index),
-      };
-    });
-
-  if (slides.length < pageCount) {
-    throw new Error("AI returned fewer slides than requested.");
-  }
-
-  return { slides };
+  language: OutputLanguage,
+): GeneratedSlide[] {
+  const sentences = splitIntoSentences(articleText);
+  const usefulSentences = sentences.length > 0 ? sentences : [articleText.slice(0, 360)];
+  return Array.from({ length: pageCount }, (_, index) => {
+    const sentence = usefulSentences[index % usefulSentences.length];
+    const title = makeFallbackTitle(index, language);
+    const text = compactText(sentence, language, "body");
+    const imagePrompt = makeImagePrompt(`${title} ${text}`, index);
+    return { title, text, imagePrompt, imageUrl: makeImageUrl(imagePrompt, index) };
+  });
 }
+function extractJsonObject(value: string) {
+  const fenced = value.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+  const candidate = fenced ?? value;
+  const firstBrace = candidate.indexOf("{");
+  if (firstBrace === -1) {
+    throw new Error("The AI returned text instead of JSON.");
+  }
 
-async function generateWithHuggingFace(prompt: string) {
-  const hfToken = getEnvValue("HF_TOKEN");
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
 
-  const response = await fetch(
-    "https://router.huggingface.co/v1/chat/completions",
-    {
+  for (let index = firstBrace; index < candidate.length; index += 1) {
+    const char = candidate[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = inString;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+
+    if (depth === 0) {
+      return candidate.slice(firstBrace, index + 1);
+    }
+  }
+
+  throw new Error("The AI returned incomplete JSON.");
+}
+function parseSlidesFromModel(value: string) {
+  const json = extractJsonObject(value);
+  const parsed = JSON.parse(json) as { slides?: ModelSlide[] };
+  if (!Array.isArray(parsed.slides)) {
+    throw new Error("The AI JSON did not include a slides array.");
+  }
+  return parsed.slides.map((slide) => ({
+    title: typeof slide.title === "string" ? slide.title.trim() : "",
+    text: typeof slide.text === "string" ? slide.text.trim() : "",
+    imagePrompt: typeof slide.imagePrompt === "string" ? slide.imagePrompt.trim() : "",
+  }));
+}
+function isValidSlides(
+  slides: Array<{ title: string; text: string }>,
+  pageCount: number,
+  language: OutputLanguage,
+) {
+  if (slides.length < pageCount) return false;
+  return slides.slice(0, pageCount).every((slide) => {
+    const combined = `${slide.title} ${slide.text}`;
+    if (slide.title.length < 2 || slide.text.length < 18) return false;
+    if (/전체 이야기|중요한 흐름과 의미|한눈에 이해|짧게 정리합니다|핵심 내용을 요약하면/i.test(combined))
+      return false;
+    if (language === "ko" && !/[가-힣]/.test(combined)) return false;
+    if (language === "en" && !/[A-Za-z]{4,}/.test(combined)) return false;
+    return true;
+  });
+}
+function buildSummarySystemPrompt(sourceLanguage: OutputLanguage, pageCount: number) {
+  const sourceLanguageName = sourceLanguage === "ko" ? "Korean" : "English";
+  return [
+    "You convert article text into Instagram carousel slide copy.",
+    "Return only valid JSON. No markdown. No commentary.",
+    `First summarize the article in its source language: ${sourceLanguageName}.`,
+    `Create exactly ${pageCount} slides.`,
+    "Every slide must summarize one concrete point from the article.",
+    "Write in third person. Never use first person (I, we, our, 우리, 저는, etc).",
+    "Write as if explaining the idea to a reader, not as the author speaking.",
+    "Do not write generic filler.",
+    "Do not repeat the same point.",
+    "Keep every title short and declarative.",
+    "Keep every text field to one clear sentence that summarizes a fact or insight.",
+    "Use natural social-media wording, but do not invent facts.",
+    "For imagePrompt, write an English visual prompt for a different contextual background image for that specific slide.",
+    "Each imagePrompt must mention concrete visual subjects from the slide context, not generic abstract gradients.",
+    'JSON format: {"slides":[{"title":"...","text":"...","imagePrompt":"..."}]}',
+  ].join("\n");
+}
+function buildTranslationSystemPrompt(targetLanguage: OutputLanguage, pageCount: number) {
+  const targetLanguageName = targetLanguage === "ko" ? "Korean" : "English";
+  return [
+    "Translate Instagram carousel slide copy.",
+    "Return only valid JSON. No markdown. No commentary.",
+    `Final output language: ${targetLanguageName}.`,
+    `Translate exactly ${pageCount} slides.`,
+    "Preserve the meaning, order, specificity, and factual claims.",
+    "Keep every title short and declarative.",
+    "Keep every text field to one clear sentence.",
+    "Do not add, remove, merge, or repeat points.",
+    'JSON format: {"slides":[{"title":"...","text":"..."}]}',
+  ].join("\n");
+}
+function buildUserPrompt(articleText: string) {
+  return `ARTICLE TEXT:\n${articleText.slice(0, MAX_ARTICLE_CHARS)}`;
+}
+function buildTranslationUserPrompt(slides: Array<{ title: string; text: string }>) {
+  return `SLIDES TO TRANSLATE:\n${JSON.stringify({ slides })}`;
+}
+function getModelCandidates() {
+  const envModel = getOptionalEnvValue("HF_MODEL");
+  return [
+    "Qwen/Qwen2.5-7B-Instruct:together",
+    "meta-llama/Llama-3.1-8B-Instruct:nscale",
+    "google/gemma-3n-E4B-it:together",
+    "openai/gpt-oss-20b:novita",
+    "Qwen/Qwen3-4B-Instruct-2507:nscale",
+    envModel,
+  ].filter((model, index, array): model is string => {
+    return Boolean(model) && array.indexOf(model) === index;
+  });
+}
+async function callHuggingFaceChatCompletion(args: {
+  model: string;
+  messages: ChatMessage[];
+  maxTokens?: number;
+  temperature?: number;
+}) {
+  const token = getHFToken();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(HF_CHAT_COMPLETIONS_URL, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${hfToken}`,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "meta-llama/Llama-3.1-8B-Instruct",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a social media content strategist. Return only valid JSON.",
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-        temperature: 0.7,
-        max_tokens: 2500,
+        model: args.model,
+        messages: args.messages,
+        max_tokens: args.maxTokens ?? 1400,
+        temperature: args.temperature ?? 0.2,
       }),
+      signal: controller.signal,
+    });
+    const rawText = await response.text();
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${rawText.slice(0, 700)}`);
     }
-  );
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    const message =
-      typeof data?.error === "string"
-        ? data.error
-        : JSON.stringify(data, null, 2);
-
-    throw new Error(message || "Hugging Face generation failed.");
-  }
-
-  const content = data?.choices?.[0]?.message?.content;
-
-  if (typeof content !== "string") {
-    throw new Error("Hugging Face response did not include text content.");
-  }
-
-  return content;
-}
-
-export async function GET() {
-  return Response.json({
-    ok: true,
-    route: ROUTE_VERSION,
-  });
-}
-
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-
-    const url = typeof body.url === "string" ? body.url.trim() : "";
-
-    const articleText =
-      typeof body.articleText === "string" ? body.articleText.trim() : "";
-
-    const language = typeof body.language === "string" ? body.language : "en";
-
-    const pageCount = clampPageCount(body.pageCount);
-
-    if (!url && !articleText) {
-      return Response.json(
-        {
-          error: "Please enter an article URL or paste article text manually.",
-        },
-        { status: 400 }
+    let data: unknown;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      throw new Error(`Invalid JSON response: ${rawText.slice(0, 700)}`);
+    }
+    const content =
+      typeof data === "object" &&
+      data !== null &&
+      "choices" in data &&
+      Array.isArray((data as { choices?: unknown }).choices)
+        ? (data as { choices: Array<{ message?: { content?: unknown } }> }).choices[0]?.message
+            ?.content
+        : undefined;
+    if (!content || typeof content !== "string") {
+      throw new Error(
+        `No generated content returned: ${JSON.stringify(data).slice(0, 700)}`,
       );
     }
+    return content.trim();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+async function callHuggingFace(systemPrompt: string, userPrompt: string) {
+  const errors: string[] = [];
+  for (const model of getModelCandidates()) {
+    try {
+      const result = await callHuggingFaceChatCompletion({
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        maxTokens: 1400,
+        temperature: 0.2,
+      });
+      console.log(`[hf:success] ${model}`);
+      return result;
+    } catch (error) {
+      const message = `${model}: ${safeErrorMessage(error)}`;
+      errors.push(message);
+      console.error("[hf:error]", message);
+    }
+  }
+  throw new Error(`Hugging Face failed: ${errors.join(" | ")}`);
+}
+async function generateSlidesWithAi(
+  articleText: string,
+  pageCount: number,
+  language: OutputLanguage,
+) {
+  const sourceLanguage = detectSourceLanguage(articleText);
+  const systemPrompt = buildSummarySystemPrompt(sourceLanguage, pageCount);
+  const userPrompt = buildUserPrompt(articleText);
+  const summaryOutput = await callHuggingFace(systemPrompt, userPrompt);
+  const sourceSlides = parseSlidesFromModel(summaryOutput);
+  if (!isValidSlides(sourceSlides, pageCount, sourceLanguage)) {
+    throw new Error(
+      sourceLanguage === "ko"
+        ? "AI returned invalid Korean source summaries. Using local fallback."
+        : "AI returned invalid English source summaries. Using local fallback.",
+    );
+  }
 
-    let article = articleText;
+  const finalSlides =
+    sourceLanguage === language
+      ? sourceSlides
+      : parseSlidesFromModel(
+          await callHuggingFace(
+            buildTranslationSystemPrompt(language, pageCount),
+            buildTranslationUserPrompt(sourceSlides.slice(0, pageCount)),
+          ),
+        );
 
-    if (!article && url) {
-      try {
-        article = await fetchArticle(url);
-      } catch (error) {
-        console.error("[fetchArticle:error]", error);
+  if (!isValidSlides(finalSlides, pageCount, language)) {
+    throw new Error(
+      language === "ko"
+        ? "AI returned invalid Korean translated slides. Using local fallback."
+        : "AI returned invalid English translated slides. Using local fallback.",
+    );
+  }
 
-        return Response.json(
-          {
-            error:
-              "Could not fetch article. Status: 403. This site may block server fetching. Paste the article text manually instead.",
-          },
-          { status: 403 }
+  return finalSlides.slice(0, pageCount).map((slide, index) => {
+    const sourceSlide = sourceSlides[index] ?? slide;
+    const title = compactText(
+      slide.title || makeFallbackTitle(index, language),
+      language,
+      "title",
+    );
+    const text = compactText(slide.text, language, "body");
+    const imagePrompt =
+      sourceSlide.imagePrompt || makeImagePrompt(`${sourceSlide.title} ${sourceSlide.text}`, index);
+    return { title, text, imagePrompt, imageUrl: makeImageUrl(imagePrompt, index) };
+  });
+}
+async function getArticleTextFromRequest(body: GenerateRequestBody) {
+  const inputText = typeof body.articleText === "string" ? body.articleText.trim() : "";
+  const inputUrl = typeof body.url === "string" ? body.url.trim() : "";
+  if (inputText.length >= MIN_TEXT_INPUT_LENGTH) {
+    return inputText.slice(0, MAX_ARTICLE_CHARS);
+  }
+  return fetchArticle(inputUrl);
+}
+export async function GET() {
+  return NextResponse.json({
+    ok: true,
+    route: ROUTE_VERSION,
+    models: getModelCandidates(),
+    hasHFToken: Boolean(getOptionalEnvValue("HF_TOKEN")),
+  });
+}
+export async function POST(request: Request) {
+  try {
+    const body = (await request.json()) as GenerateRequestBody;
+    const language = normalizeLanguage(body.language);
+    const pageCount = clampPageCount(body.pageCount);
+    const articleText = await getArticleTextFromRequest(body);
+    const sourceLanguage = detectSourceLanguage(articleText);
+    if (!articleText || articleText.length < MIN_ARTICLE_LENGTH) {
+      throw new Error("Please provide a longer article or text input.");
+    }
+    try {
+      const slides = await generateSlidesWithAi(articleText, pageCount, language);
+      return NextResponse.json({
+        slides,
+        meta: {
+          route: ROUTE_VERSION,
+          mode: "ai",
+          sourceLanguage,
+        },
+      });
+    } catch (error) {
+      console.error("[generate:ai-fallback]", error);
+      if (sourceLanguage !== language) {
+        throw new Error(
+          `Could not generate ${language === "ko" ? "Korean" : "English"} translation because the AI provider failed. ${safeErrorMessage(error)}`,
         );
       }
+      return NextResponse.json({
+        slides: makeExtractiveSlides(articleText, pageCount, language),
+        meta: {
+          route: ROUTE_VERSION,
+          mode: "local-fallback",
+          warning: safeErrorMessage(error),
+          sourceLanguage,
+        },
+      });
     }
-
-    const languageInstruction = getLanguageInstruction(language);
-
-    const prompt = `
-You are an expert Instagram carousel content strategist.
-
-Create an Instagram carousel post based on the article below.
-
-Requirements:
-- Create exactly ${pageCount} carousel pages.
-- ${languageInstruction}
-- Summarize the article; do not copy/paste article sentences directly.
-- Make the content clear, concise, and engaging.
-- Each page should have a strong title and short body text.
-- Keep each title short: under 34 Korean characters or under 58 English characters.
-- Each page body must be 1-2 sentences only.
-- Each page should include a different imagePrompt for generating a visual.
-- The imagePrompt should reflect the tone and information of that page.
-- Each imagePrompt must be different from the others.
-- The carousel should feel coherent from first page to last page.
-- The first page should work as a strong hook.
-- The last page should feel like a conclusion or takeaway.
-- Return only valid JSON.
-- Do not include markdown.
-- Do not include explanations outside the JSON.
-
-Return this exact JSON structure:
-
-{
-  "slides": [
-    {
-      "title": "Page title",
-      "text": "Page body text",
-      "imagePrompt": "Image generation prompt for this page"
-    }
-  ]
-}
-
-Article:
-${article}
-`;
-
-    let normalized: GeneratedResponse;
-
-    try {
-      const aiText = await generateWithHuggingFace(prompt);
-      const parsed = extractJson(aiText);
-      normalized = normalizeGeneratedResponse(parsed, pageCount, language);
-    } catch (error) {
-      console.error("[generate:fallback]", error);
-      normalized = summarizeFallback(article, pageCount, language);
-    }
-
-    const withImages = await attachInternetImages(normalized, article);
-
-    return Response.json(withImages);
   } catch (error) {
     console.error("[generate:error]", error);
-
-    return Response.json(
-      {
-        error:
-          error instanceof Error
-            ? error.message
-            : "Failed to generate carousel.",
-      },
-      { status: 500 }
+    return NextResponse.json(
+      { error: safeErrorMessage(error) || "Failed to generate post." },
+      { status: 500 },
     );
   }
 }
