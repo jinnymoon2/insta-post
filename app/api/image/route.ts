@@ -137,7 +137,8 @@ export async function GET(request: NextRequest) {
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; InstaPostImageProxy/1.0)"
       },
-      cache: "no-store"
+      cache: "no-store",
+      signal: AbortSignal.timeout(20000),
     });
 
     if (!response.ok) {
@@ -145,6 +146,11 @@ export async function GET(request: NextRequest) {
     }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
+
+    if (!contentType.startsWith("image/")) {
+      return generatedImageResponse(url);
+    }
+
     const buffer = await response.arrayBuffer();
 
     return new NextResponse(buffer, {

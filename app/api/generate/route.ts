@@ -1,7 +1,7 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const ROUTE_VERSION = "generate-route-4x5-two-sentence-v3";
+const ROUTE_VERSION = "generate-route-web-backgrounds-v4";
 
 type GeneratedSlide = {
   title: string;
@@ -12,6 +12,14 @@ type GeneratedSlide = {
 
 type GeneratedResponse = {
   slides: GeneratedSlide[];
+};
+
+type WikimediaPage = {
+  imageinfo?: Array<{
+    mime?: string;
+    thumburl?: string;
+    url?: string;
+  }>;
 };
 
 function getEnvValue(name: string) {
@@ -259,6 +267,304 @@ function makeImagePrompt(slideText: string, index: number) {
 
 function makeImageUrl(imagePrompt: string, index: number) {
   return `instapost-generated://slide-${index + 1}/${encodeURIComponent(imagePrompt)}`;
+}
+
+function compactSearchQuery(value: string) {
+  return value
+    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+    .replace(/\b(slide|page|summary|background|editorial|abstract|photo|image)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 140);
+}
+
+function extractSearchPhrases(value: string) {
+  const phraseMatches =
+    value.match(
+      /\b(?:[A-Z][A-Za-z0-9+.-]*|[A-Z]{2,}|\d+[A-Za-z0-9+.-]*)\b(?:\s+\b(?:[A-Z][A-Za-z0-9+.-]*|[A-Z]{2,}|\d+[A-Za-z0-9+.-]*)\b){0,4}/g,
+    ) ?? [];
+
+  return Array.from(
+    new Set(
+      phraseMatches
+        .map((phrase) => phrase.replace(/^(The|A|An)\s+/i, "").trim())
+        .filter((phrase) => phrase.length > 3 && !/^(This|That|With)$/i.test(phrase)),
+    ),
+  ).slice(0, 5);
+}
+
+function getTopicImageQueries(value: string) {
+  const lower = value.toLowerCase();
+  const queries: string[] = [];
+
+  if (/(robot|robots|robotic|robotics|humanoid|automation|factory|manufactur|warehouse)/.test(lower)) {
+    queries.push(
+      "industrial robot factory",
+      "factory automation robot",
+      "robot arm manufacturing",
+      "industrial robot arm",
+      "factory robot arm",
+      "manufacturing robot",
+      "industrial automation robot",
+      "automated factory robot",
+      "collaborative robot manufacturing",
+      "KUKA robot factory",
+      "FANUC industrial robot",
+      "humanoid robot",
+      "warehouse robot",
+    );
+  }
+
+  if (/(raspberry pi|single-board|processor|cpu|usb|computer board|circuit board)/.test(lower)) {
+    queries.push(
+      "Raspberry Pi 5",
+      "Raspberry Pi computer board",
+      "single board computer",
+      "computer processor board",
+    );
+  }
+
+  if (/(ai|artificial intelligence|machine learning|agent|software|startup|technology)/.test(lower)) {
+    queries.push(
+      "artificial intelligence technology",
+      "computer server technology",
+      "software engineering workspace",
+      "machine learning computer",
+    );
+  }
+
+  if (/(resume|job|career|interview|hiring|recruit|workplace)/.test(lower)) {
+    queries.push(
+      "job interview office",
+      "resume career workplace",
+      "office work computer",
+    );
+  }
+
+  return queries;
+}
+
+function buildImageQueries(
+  slide: GeneratedSlide,
+  articleKeywords: string[],
+  article: string,
+) {
+  const slideKeywords = extractKeywords(`${slide.title} ${slide.text}`, 6);
+  const articleTopic = articleKeywords.slice(0, 5).join(" ");
+  const slideTopic = slideKeywords.join(" ");
+  const articlePhrases = extractSearchPhrases(article);
+  const slidePhrases = extractSearchPhrases(`${slide.title} ${slide.text}`);
+  const mainPhrase = articlePhrases[0] ?? articleTopic;
+  const topicQueries = getTopicImageQueries(
+    `${article} ${slide.title} ${slide.text} ${slide.imagePrompt}`,
+  );
+  const tone = detectTone(`${slide.title} ${slide.text} ${articleTopic}`);
+  const contextWord =
+    tone === "technology"
+      ? "computer board technology hardware"
+      : tone === "education"
+        ? "education research"
+        : tone === "climate"
+          ? "nature environment"
+          : "news editorial";
+
+  return Array.from(
+    new Set(
+      [
+        ...topicQueries,
+        ...topicQueries.map((query) => `${query} ${slideKeywords.slice(0, 2).join(" ")}`),
+        mainPhrase,
+        `${mainPhrase} computer board`,
+        `${mainPhrase} ${slideKeywords.slice(0, 2).join(" ")}`,
+        ...articlePhrases.map((phrase) => `${phrase} ${contextWord}`),
+        `${mainPhrase} ${contextWord}`,
+        ...slidePhrases.map((phrase) => `${mainPhrase} ${phrase}`),
+        `${articleKeywords.slice(0, 3).join(" ")} ${contextWord}`,
+        `${slideKeywords.slice(0, 3).join(" ")} ${contextWord}`,
+        `${slideTopic} ${articleKeywords.slice(0, 3).join(" ")}`,
+        `${articleTopic} ${slide.title}`,
+      ]
+        .map(compactSearchQuery)
+        .filter((query) => query.length > 8),
+    ),
+  );
+}
+
+async function getWikimediaImageCandidates(query: string) {
+  const searchParams = new URLSearchParams({
+    action: "query",
+    generator: "search",
+    gsrsearch: query,
+    gsrnamespace: "6",
+    gsrlimit: "50",
+    prop: "imageinfo",
+    iiprop: "url|mime",
+    iiurlwidth: "1400",
+    format: "json",
+    origin: "*",
+  });
+
+  const response = await fetch(
+    `https://commons.wikimedia.org/w/api.php?${searchParams.toString()}`,
+    {
+      headers: {
+        "User-Agent": "InstaPost/1.0 (local carousel image search)",
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(5000),
+    },
+  );
+
+  if (!response.ok) {
+    return [];
+  }
+
+  const data = (await response.json()) as {
+    query?: { pages?: Record<string, WikimediaPage> };
+  };
+  const pages = Object.values(data.query?.pages ?? {});
+
+  return pages
+    .map((page) => {
+      const info = page.imageinfo?.[0];
+
+      return {
+        imageUrl: info?.thumburl || info?.url || "",
+        mime: info?.mime ?? "",
+      };
+    })
+    .filter(
+      (candidate) =>
+        candidate.imageUrl && /^image\/(jpeg|png|webp)$/i.test(candidate.mime),
+    )
+    .map((candidate) => candidate.imageUrl);
+}
+
+async function searchWikimediaImage(query: string, usedUrls: Set<string>) {
+  const candidates = await getWikimediaImageCandidates(query);
+
+  for (const imageUrl of candidates) {
+    if (!usedUrls.has(imageUrl)) {
+      usedUrls.add(imageUrl);
+      return imageUrl;
+    }
+  }
+
+  return "";
+}
+
+async function buildCandidateImagePool(
+  queries: string[],
+  usedUrls: Set<string>,
+  maxItems: number,
+) {
+  const pool: string[] = [];
+
+  for (const query of queries) {
+    try {
+      const candidates = await getWikimediaImageCandidates(query);
+
+      for (const imageUrl of candidates) {
+        if (!usedUrls.has(imageUrl) && !pool.includes(imageUrl)) {
+          pool.push(imageUrl);
+
+          if (pool.length >= maxItems) {
+            return pool;
+          }
+        }
+      }
+    } catch (error) {
+      console.error("[image-pool:error]", query, error);
+    }
+  }
+
+  return pool;
+}
+
+async function findInternetImageForSlide(
+  slide: GeneratedSlide,
+  articleKeywords: string[],
+  article: string,
+  usedUrls: Set<string>,
+) {
+  const queries = buildImageQueries(slide, articleKeywords, article);
+
+  for (const query of queries) {
+    try {
+      const imageUrl = await searchWikimediaImage(query, usedUrls);
+
+      if (imageUrl) {
+        return imageUrl;
+      }
+    } catch (error) {
+      console.error("[image-search:error]", query, error);
+    }
+  }
+
+  return "";
+}
+
+async function attachInternetImages(
+  generated: GeneratedResponse,
+  article: string,
+): Promise<GeneratedResponse> {
+  const articleKeywords = extractKeywords(article, 8);
+  const usedUrls = new Set<string>();
+  const broadQueries = Array.from(
+    new Set(
+      [
+        ...getTopicImageQueries(article),
+        `${articleKeywords.slice(0, 3).join(" ")} news editorial`,
+        `${articleKeywords.slice(0, 4).join(" ")}`,
+      ]
+        .map(compactSearchQuery)
+        .filter((query) => query.length > 8),
+    ),
+  );
+  const imagePool = await buildCandidateImagePool(
+    broadQueries,
+    usedUrls,
+    generated.slides.length + 20,
+  );
+  const slides: GeneratedSlide[] = [];
+
+  for (let index = 0; index < generated.slides.length; index += 1) {
+    const slide = generated.slides[index];
+    const internetImageUrl = await findInternetImageForSlide(
+      slide,
+      articleKeywords,
+      article,
+      usedUrls,
+    );
+    const pooledImageUrl = imagePool.find((imageUrl) => !usedUrls.has(imageUrl));
+
+    if (pooledImageUrl) {
+      usedUrls.add(pooledImageUrl);
+    }
+
+    slides.push({
+      ...slide,
+      imageUrl:
+        internetImageUrl ||
+        pooledImageUrl ||
+        slide.imageUrl ||
+        makeImageUrl(slide.imagePrompt, index),
+    });
+  }
+
+  return {
+    slides: slides.map((slide, index) => ({
+      ...slide,
+      imagePrompt:
+        slide.imagePrompt || makeImagePrompt(`${slide.title} ${slide.text}`, index),
+      imageUrl:
+        slide.imageUrl ||
+        makeImageUrl(
+          slide.imagePrompt || makeImagePrompt(`${slide.title} ${slide.text}`, index),
+          index,
+        ),
+    })),
+  };
 }
 
 function summarizeFallback(article: string, pageCount: number, language: string): GeneratedResponse {
@@ -526,7 +832,9 @@ ${article}
       normalized = summarizeFallback(article, pageCount, language);
     }
 
-    return Response.json(normalized);
+    const withImages = await attachInternetImages(normalized, article);
+
+    return Response.json(withImages);
   } catch (error) {
     console.error("[generate:error]", error);
 

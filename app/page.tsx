@@ -4,6 +4,7 @@ import { saveAs } from "file-saver";
 import { toPng } from "html-to-image";
 import jsPDF from "jspdf";
 import JSZip from "jszip";
+import Image from "next/image";
 import type { CSSProperties } from "react";
 import { useRef, useState } from "react";
 
@@ -28,6 +29,9 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
+  const [failedBackgrounds, setFailedBackgrounds] = useState<Set<number>>(
+    new Set(),
+  );
   const slideRefs = useRef<Array<HTMLDivElement | null>>([]);
 
   const canGenerate =
@@ -38,6 +42,7 @@ export default function Home() {
     setError("");
     setSlides([]);
     setRawResult("");
+    setFailedBackgrounds(new Set());
     slideRefs.current = [];
 
     try {
@@ -74,6 +79,40 @@ export default function Home() {
 
   function proxiedImageUrl(imageUrl: string) {
     return `/api/image?url=${encodeURIComponent(imageUrl)}`;
+  }
+
+  function fallbackImageUrl(slide: GeneratedSlide, index: number) {
+    const prompt =
+      slide.imagePrompt || `${slide.title ?? ""} ${slide.text ?? ""}`.trim();
+
+    return `instapost-generated://slide-${index + 1}/${encodeURIComponent(
+      prompt || `carousel page ${index + 1}`,
+    )}`;
+  }
+
+  function slideBackgroundUrl(slide: GeneratedSlide, index: number) {
+    const imageUrl = slide.imageUrl ?? "";
+
+    if (!failedBackgrounds.has(index) && /^https?:\/\//.test(imageUrl)) {
+      return imageUrl;
+    }
+
+    return proxiedImageUrl(
+      failedBackgrounds.has(index) || !imageUrl
+        ? fallbackImageUrl(slide, index)
+        : imageUrl,
+    );
+  }
+
+  function slideFallbackBackgroundStyle(
+    slide: GeneratedSlide,
+    index: number,
+  ): CSSProperties {
+    return {
+      backgroundImage: `url("${proxiedImageUrl(fallbackImageUrl(slide, index))}")`,
+      backgroundPosition: "center",
+      backgroundSize: "cover",
+    };
   }
 
   function getSlideTextStyle(slide: GeneratedSlide): CSSProperties {
@@ -352,13 +391,21 @@ export default function Home() {
                       slideRefs.current[index] = element;
                     }}
                     className="relative aspect-[4/5] w-full overflow-hidden bg-neutral-900 shadow-2xl shadow-black/50"
+                    style={slideFallbackBackgroundStyle(slide, index)}
                   >
-                    <div
-                      className="absolute inset-0 scale-[1.03] bg-cover bg-center"
-                      style={{
-                        backgroundImage: slide.imageUrl
-                          ? `url("${proxiedImageUrl(slide.imageUrl)}")`
-                          : undefined,
+                    <Image
+                      alt=""
+                      aria-hidden="true"
+                      fill
+                      unoptimized
+                      className="scale-[1.03] object-cover"
+                      src={slideBackgroundUrl(slide, index)}
+                      onError={() => {
+                        setFailedBackgrounds((current) => {
+                          const next = new Set(current);
+                          next.add(index);
+                          return next;
+                        });
                       }}
                     />
                     <div className="absolute inset-0 bg-gradient-to-b from-black/0 via-black/10 to-black/78" />
