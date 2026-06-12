@@ -23,7 +23,11 @@ export const maxDuration = 30;
 // ---------------------------------------------------------------------------
 const POLLINATIONS_TOKEN = process.env.POLLINATIONS_TOKEN?.trim() ?? "";
 const POLLINATIONS_REFERRER = process.env.POLLINATIONS_REFERRER?.trim() ?? "";
+const HF_TOKEN = process.env.HF_TOKEN?.trim() ?? "";
+const HF_IMAGE_MODEL =
+  process.env.HF_IMAGE_MODEL?.trim() || "black-forest-labs/FLUX.1-schnell";
 
+const HF_IMAGE_TIMEOUT_MS = 25000;
 const PRIMARY_TIMEOUT_MS = 15000; // flux: best quality, slower
 const RETRY_TIMEOUT_MS = 12000; // turbo: faster, used when flux fails/times out
 const EXTERNAL_TIMEOUT_MS = 12000; // pass-through fetch for real http(s) image URLs
@@ -101,6 +105,22 @@ function buildPollinationsUrl(
   )}?${params.toString()}`;
 }
 
+function buildImagePrompt(prompt: string) {
+  return [
+    cleanPrompt(prompt),
+    "vertical Instagram carousel background",
+    "editorial magazine photography",
+    "specific visible subject matter from the prompt",
+    "cinematic light",
+    "layered depth",
+    "dark lower area for white text overlay",
+    "high quality",
+    "no words",
+    "no letters",
+    "no watermark",
+  ].join(", ");
+}
+
 function pollinationsHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
@@ -120,28 +140,67 @@ function pollinationsHeaders(): Record<string, string> {
 // (non-2xx, non-image content type, suspiciously small body, timeout, network error).
 async function fetchAsImage(
   url: string,
-  init: { headers?: Record<string, string>; timeoutMs: number },
+  init: { body?: BodyInit; headers?: Record<string, string>; label?: string; timeoutMs: number },
 ): Promise<{ buffer: ArrayBuffer; contentType: string } | null> {
   try {
     const response = await fetch(url, {
-      method: "GET",
+      method: init.body ? "POST" : "GET",
+      body: init.body,
       headers: init.headers,
       cache: "no-store",
       signal: AbortSignal.timeout(init.timeoutMs),
     });
 
-    if (!response.ok) return null;
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      console.error(
+        `[image] ${init.label ?? "fetch"} failed: HTTP ${response.status} ${errorText.slice(0, 220)}`,
+      );
+      return null;
+    }
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
-    if (!contentType.startsWith("image/")) return null;
+    if (!contentType.startsWith("image/")) {
+      console.error(`[image] ${init.label ?? "fetch"} returned ${contentType}`);
+      return null;
+    }
 
     const buffer = await response.arrayBuffer();
-    if (buffer.byteLength < MIN_IMAGE_BYTES) return null;
+    if (buffer.byteLength < MIN_IMAGE_BYTES) {
+      console.error(`[image] ${init.label ?? "fetch"} returned only ${buffer.byteLength} bytes`);
+      return null;
+    }
 
     return { buffer, contentType };
-  } catch {
+  } catch (error) {
+    console.error(`[image] ${init.label ?? "fetch"} error`, error);
     return null;
   }
+}
+
+async function fetchHuggingFaceImage(prompt: string) {
+  if (!HF_TOKEN) return null;
+
+  const modelPath = HF_IMAGE_MODEL.split("/").map(encodeURIComponent).join("/");
+  const url = `https://router.huggingface.co/hf-inference/models/${modelPath}`;
+
+  return fetchAsImage(url, {
+    label: "huggingface",
+    timeoutMs: HF_IMAGE_TIMEOUT_MS,
+    headers: {
+      Authorization: `Bearer ${HF_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      inputs: buildImagePrompt(prompt),
+      parameters: {
+        width: 1080,
+        height: 1350,
+        num_inference_steps: 4,
+        guidance_scale: 0,
+      },
+    }),
+  });
 }
 
 function hashString(value: string) {
@@ -248,8 +307,15 @@ export async function GET(request: NextRequest) {
   const rawUrl = request.nextUrl.searchParams.get("url") ?? "";
   const prompt = extractPrompt(rawUrl);
 
-  // Generated backgrounds (or empty url) -> Pollinations with a fallback chain.
+  // Generated backgrounds (or empty url) -> Hugging Face first, then Pollinations,
+  // then the local SVG only as a last-resort placeholder.
   if (!rawUrl || rawUrl.startsWith("instapost-generated://")) {
+    const hfResult = await fetchHuggingFaceImage(prompt);
+    if (hfResult) {
+      return imageResponse(hfResult.buffer, hfResult.contentType, "huggingface");
+    }
+    console.error("[image] huggingface image generation failed");
+
     const seed = promptSeed(prompt);
     const headers = pollinationsHeaders();
 
