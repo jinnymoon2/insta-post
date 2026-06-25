@@ -1,3 +1,4 @@
+import { fetchCaptionInspiration } from "./captionInspiration";
 import {
   buildMemeSearchQuery,
   MemeImageSource,
@@ -14,6 +15,8 @@ export type MemePlan = {
   imageUrl: string;
   imageSource: MemeImageSource;
   searchQuery: string;
+  captionSearchQuery: string;
+  captionInspiration: string[];
   topText: string;
   bottomText: string;
 };
@@ -24,11 +27,22 @@ type GenerateMemePlanInput = {
 };
 
 function normalizeText(text: string) {
-  return text.replace(/\s+/g, " ").trim().slice(0, 6000);
+  return text
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 6000);
 }
 
 function extractKeywords(text: string, language: MemeLanguage) {
   const cleaned = text
+    .replace(/&#x27;/g, " ")
+    .replace(/&#39;/g, " ")
+    .replace(/&quot;/g, " ")
+    .replace(/&amp;/g, " ")
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .split(/\s+/)
     .filter(Boolean);
@@ -90,6 +104,24 @@ function extractKeywords(text: string, language: MemeLanguage) {
           "while",
           "because",
           "through",
+          "for",
+          "are",
+          "not",
+          "you",
+          "your",
+          "its",
+          "it's",
+          "to",
+          "in",
+          "on",
+          "of",
+          "as",
+          "is",
+          "a",
+          "an",
+          "x27",
+          "quot",
+          "amp",
         ]);
 
   const counts = new Map<string, number>();
@@ -97,7 +129,8 @@ function extractKeywords(text: string, language: MemeLanguage) {
   for (const word of cleaned) {
     const normalized = word.toLowerCase();
 
-    if (normalized.length < 2) continue;
+    if (normalized.length < 3) continue;
+    if (/^\d+$/.test(normalized)) continue;
     if (stopwords.has(normalized)) continue;
 
     counts.set(normalized, (counts.get(normalized) || 0) + 1);
@@ -223,107 +256,160 @@ function detectDynamicVibe(text: string, language: MemeLanguage) {
     : "person reacting dramatically to unexpected news";
 }
 
-function makeCaption(language: MemeLanguage, vibe: string, keywords: string[]) {
-  const main = keywords[0] || (language === "ko" ? "이 뉴스" : "this news");
-  const second = keywords[1] || (language === "ko" ? "현실" : "reality");
-  const third = keywords[2] || (language === "ko" ? "상황" : "situation");
+function pickRandom<T>(items: T[], fallback: T) {
+  if (items.length === 0) return fallback;
+  return items[Math.floor(Math.random() * items.length)] ?? fallback;
+}
 
+function shorten(value: string, maxLength: number) {
+  const cleaned = value.replace(/\s+/g, " ").trim();
+
+  if (cleaned.length <= maxLength) return cleaned;
+
+  return `${cleaned.slice(0, maxLength - 1).trim()}…`;
+}
+
+function extractShortInspiration(phrases: string[], language: MemeLanguage) {
+  const cleaned = phrases
+    .map((phrase) =>
+      phrase
+        .replace(/\s+/g, " ")
+        .replace(/^[^a-zA-Z가-힣0-9]+/, "")
+        .replace(/[^a-zA-Z가-힣0-9?!'"“”‘’.,\s-]+$/g, "")
+        .trim(),
+    )
+    .filter((phrase) => phrase.length >= 12 && phrase.length <= 120);
+
+  const selected = pickRandom(
+    cleaned,
+    language === "ko" ? "이게 진짜 요즘 상황" : "This is literally the situation",
+  );
+
+  return shorten(selected, language === "ko" ? 36 : 48);
+}
+
+function makeCaption({
+  language,
+  vibe,
+  keywords,
+  inspirationPhrases,
+}: {
+  language: MemeLanguage;
+  vibe: string;
+  keywords: string[];
+  inspirationPhrases: string[];
+}) {
+  const main = keywords[0] || (language === "ko" ? "이 뉴스" : "this update");
+  const second = keywords[1] || (language === "ko" ? "현실" : "reality");
+  const third = keywords[2] || (language === "ko" ? "상황" : "the situation");
+  const inspiration = extractShortInspiration(inspirationPhrases, language);
   const vibeLower = vibe.toLowerCase();
 
+  const randomSeed = Math.floor(Math.random() * 1000000);
+  const variant = randomSeed % 12;
+
   if (language === "ko") {
+    const topOptions = [
+      `${main} 보기 전의 나`,
+      `나: ${main} 별거 아니겠지`,
+      `처음엔 ${main} 그냥 넘겼는데`,
+      `사람들: ${main} 또 나온 거 아님?`,
+      `${main} 소식 들은 내 표정`,
+      `오늘의 인터넷: ${main}`,
+      `내가 이해한 ${main}`,
+      `아직 ${second} 모르는 나`,
+      inspiration,
+      `${third} 설명 들은 후`,
+      `분명 간단한 얘기였는데`,
+      `이쯤 되면 ${main}이 주인공`,
+    ];
+
+    const bottomOptions = [
+      `현실: 전혀 간단하지 않았음`,
+      `알고 보니 ${second}가 핵심이었음`,
+      `그리고 하루가 사라졌습니다`,
+      `근데 이제 진짜 문제가 시작됨`,
+      `나만 이렇게 이해한 거 아니죠?`,
+      `이게 바로 요즘 밈이 되는 과정`,
+      `결론: 생각보다 더 심각함`,
+      `그래서 이제 ${third}도 바뀐다고요?`,
+      `웃긴데 안 웃김`,
+      `인터넷은 이미 반응 중`,
+      `잠깐만요 이게 실화라고요?`,
+      `이제 모른 척 못 함`,
+    ];
+
     if (vibe.includes("AI") || vibeLower.includes("ai")) {
-      return {
-        topText: `사람들: ${main} 그냥 새 기능 아닌가요?`,
-        bottomText: `현실: 아니요, 판이 바뀌었습니다`,
-      };
+      bottomOptions.push(
+        "AI 업계: 아니요, 판이 바뀌었습니다",
+        "개발자들: 웃고 있지만 눈은 안 웃음",
+        "편해진 건 맞는데 마음은 불편함",
+      );
     }
 
     if (vibe.includes("개발") || vibe.includes("버그")) {
-      return {
-        topText: `개발자: ${main} 금방 끝나겠지`,
-        bottomText: `현실: ${second} 때문에 하루 삭제`,
-      };
-    }
-
-    if (vibe.includes("회사") || vibe.includes("업무")) {
-      return {
-        topText: `회사: ${main} 이거 간단하죠?`,
-        bottomText: `나: 그 말이 제일 무섭습니다`,
-      };
-    }
-
-    if (vibe.includes("충격") || vibe.includes("반전")) {
-      return {
-        topText: `${main} 보기 전의 나`,
-        bottomText: `보고 난 후: 잠깐만 이게 실화라고?`,
-      };
-    }
-
-    if (vibe.includes("성공") || vibe.includes("잘 풀려")) {
-      return {
-        topText: `${main} 처음 봤을 때`,
-        bottomText: `생각보다 너무 잘돼서 당황함`,
-      };
-    }
-
-    if (vibe.includes("어려운") || vibe.includes("현실")) {
-      return {
-        topText: `${main} 별거 아니겠지 했는데`,
-        bottomText: `알고 보니 ${third}가 핵심이었음`,
-      };
+      bottomOptions.push(
+        "현실: 디버깅 파티 시작",
+        "개발자: 왜 또 나야",
+        "간단한 수정이 아니었습니다",
+      );
     }
 
     return {
-      topText: `${main} 뉴스 보기 전`,
-      bottomText: `보고 난 후: 그래서 이제 ${second}도 바뀐다고요?`,
+      topText: pickRandom(topOptions, `${main} 보기 전의 나`),
+      bottomText: pickRandom(bottomOptions, `현실: ${second} 때문에 하루 삭제`),
     };
   }
 
+  const topOptions = [
+    `Me before reading about ${main}`,
+    `Me: "${main} is probably simple"`,
+    `Everyone acting normal about ${main}`,
+    `The internet seeing ${main}`,
+    `Me trying to understand ${main}`,
+    `Before ${second} entered the chat`,
+    inspiration,
+    `Nobody:`,
+    `The article: "${main}"`,
+    `Me opening the article for 2 seconds`,
+    `When ${main} sounds harmless`,
+    `POV: you just learned about ${main}`,
+  ];
+
+  const bottomOptions = [
+    `Reality: it was not simple`,
+    `Also reality: ${second} changed everything`,
+    `And somehow this is my problem now`,
+    `The comments are already writing themselves`,
+    `That aged badly in record time`,
+    `Nobody is safe from ${third}`,
+    `The plot twist has entered the chat`,
+    `Internet reaction: completely reasonable panic`,
+    `I laughed, then realized it was serious`,
+    `So we are all pretending this is fine?`,
+    `This is how the meme economy begins`,
+    `Wait, that's actually real?`,
+  ];
+
   if (vibeLower.includes("ai")) {
-    return {
-      topText: `People: "${main} is just another update"`,
-      bottomText: `AI industry: "That aged badly."`,
-    };
+    bottomOptions.push(
+      `AI industry: "That aged badly."`,
+      `Developers laughing nervously in the corner`,
+      `Cool feature. Slight existential crisis.`,
+    );
   }
 
   if (vibeLower.includes("developer") || vibeLower.includes("programmer") || vibeLower.includes("bug")) {
-    return {
-      topText: `Me: "This ${main} update should be simple"`,
-      bottomText: `Also me 6 hours later: debugging ${second}`,
-    };
-  }
-
-  if (vibeLower.includes("office") || vibeLower.includes("company")) {
-    return {
-      topText: `Management: "Can we quickly add ${main}?"`,
-      bottomText: `Engineering: "Define quickly."`,
-    };
-  }
-
-  if (vibeLower.includes("shock") || vibeLower.includes("plot twist")) {
-    return {
-      topText: `Me before reading about ${main}`,
-      bottomText: `Me after: wait, that's actually real?`,
-    };
-  }
-
-  if (vibeLower.includes("win") || vibeLower.includes("celebrating")) {
-    return {
-      topText: `When ${main} finally works`,
-      bottomText: `And nobody knows how fragile ${second} is`,
-    };
-  }
-
-  if (vibeLower.includes("harder") || vibeLower.includes("reality")) {
-    return {
-      topText: `Me thinking ${main} was not my problem`,
-      bottomText: `The problem: now it is`,
-    };
+    bottomOptions.push(
+      `Also me 6 hours later: debugging ${second}`,
+      `The bug was in my confidence`,
+      `One does not simply "quickly fix" ${third}`,
+    );
   }
 
   return {
-    topText: `Everyone before the ${main} news`,
-    bottomText: `Everyone after: so ${second} changes now?`,
+    topText: pickRandom(topOptions, `Me before reading about ${main}`),
+    bottomText: pickRandom(bottomOptions, `Reality: ${second} changed everything`),
   };
 }
 
@@ -334,7 +420,20 @@ export async function generateMemePlan({
   const cleanText = normalizeText(sourceText);
   const keywords = extractKeywords(cleanText, language);
   const vibe = detectDynamicVibe(cleanText, language);
-  const caption = makeCaption(language, vibe, keywords);
+
+  const captionInspiration = await fetchCaptionInspiration({
+    language,
+    vibe,
+    keywords,
+  });
+
+  const caption = makeCaption({
+    language,
+    vibe,
+    keywords,
+    inspirationPhrases: captionInspiration.phrases,
+  });
+
   const searchPlan = buildMemeSearchQuery({ language, vibe, keywords });
 
   const imageUrl = `/api/meme-image?language=${encodeURIComponent(language)}&source=${encodeURIComponent(
@@ -346,11 +445,13 @@ export async function generateMemePlan({
     sourceSummary: cleanText.slice(0, 280),
     keywords,
     vibe,
-    templateId: "famous-meme-priority",
+    templateId: "current-caption-inspired",
     templateName: searchPlan.searchQuery,
     imageUrl,
     imageSource: searchPlan.source,
     searchQuery: searchPlan.searchQuery,
+    captionSearchQuery: captionInspiration.searchQuery,
+    captionInspiration: captionInspiration.phrases,
     topText: caption.topText,
     bottomText: caption.bottomText,
   };

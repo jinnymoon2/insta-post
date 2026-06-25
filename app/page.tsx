@@ -36,6 +36,8 @@ type MemeResult = {
   imageUrl: string;
   imageSource: "imgflip" | "korean-web-meme" | "pexels";
   searchQuery: string;
+  captionSearchQuery?: string;
+  captionInspiration?: string[];
   topText: string;
   bottomText: string;
 };
