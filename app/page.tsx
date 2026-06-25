@@ -6,7 +6,7 @@ import JSZip from "jszip";
 import type { CSSProperties } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-type InputMode = "url" | "text";
+type InputMode = "url" | "text" | "meme";
 type OutputLanguage = "en" | "ko";
 
 type GeneratedSlide = {
@@ -26,42 +26,83 @@ type GenerateResponse = {
   };
 };
 
-const PAGE_WIDTH = 1080; // export width; height follows the 4:5 card aspect (1350)
+type MemeResult = {
+  language: OutputLanguage;
+  sourceSummary: string;
+  keywords: string[];
+  vibe: string;
+  templateId: string;
+  templateName: string;
+  imageUrl: string;
+  imageSource: "imgflip" | "korean-web-meme" | "pexels";
+  searchQuery: string;
+  topText: string;
+  bottomText: string;
+};
+
+type MemeResponse = {
+  meme?: MemeResult;
+  error?: string;
+};
+
+const PAGE_WIDTH = 1080;
 const PAGE_COUNT_OPTIONS = Array.from({ length: 10 }, (_, index) => index + 1);
 
 export default function Home() {
   const [inputMode, setInputMode] = useState<InputMode>("url");
   const [url, setUrl] = useState("");
   const [articleText, setArticleText] = useState("");
+  const [memeUrl, setMemeUrl] = useState("");
+  const [memeText, setMemeText] = useState("");
   const [language, setLanguage] = useState<OutputLanguage>("en");
   const [pageCount, setPageCount] = useState(6);
   const [slides, setSlides] = useState<GeneratedSlide[]>([]);
+  const [memeResult, setMemeResult] = useState<MemeResult | null>(null);
   const [generationMode, setGenerationMode] = useState("");
   const [warning, setWarning] = useState("");
   const [loading, setLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState("");
   const [failedBackgrounds, setFailedBackgrounds] = useState<Set<number>>(new Set());
-  // Stores base64 data: URIs so html-to-image can capture them without re-fetching
   const [resolvedBgUrls, setResolvedBgUrls] = useState<Map<number, string>>(new Map());
+
   const slideRefs = useRef<Array<HTMLDivElement | null>>([]);
+  const memeRef = useRef<HTMLDivElement | null>(null);
 
   const canGenerate = useMemo(() => {
     if (loading) return false;
-    return inputMode === "url" ? url.trim().length > 0 : articleText.trim().length >= 80;
-  }, [articleText, inputMode, loading, url]);
+
+    if (inputMode === "url") {
+      return url.trim().length > 0;
+    }
+
+    if (inputMode === "text") {
+      return articleText.trim().length >= 80;
+    }
+
+    const hasMemeUrl = memeUrl.trim().length > 0;
+    const hasMemeText = memeText.trim().length >= 30;
+
+    return hasMemeUrl !== hasMemeText;
+  }, [articleText, inputMode, loading, memeText, memeUrl, url]);
 
   function resetResultState() {
     setError("");
     setWarning("");
     setGenerationMode("");
     setSlides([]);
+    setMemeResult(null);
     setFailedBackgrounds(new Set());
     setResolvedBgUrls(new Map());
     slideRefs.current = [];
   }
 
-  async function handleGenerate() {
+  function changeInputMode(nextMode: InputMode) {
+    resetResultState();
+    setInputMode(nextMode);
+  }
+
+  async function handleGenerateSlides() {
     setLoading(true);
     resetResultState();
 
@@ -97,12 +138,63 @@ export default function Home() {
     }
   }
 
+  async function handleGenerateMeme() {
+    setLoading(true);
+    resetResultState();
+
+    try {
+      const hasMemeUrl = memeUrl.trim().length > 0;
+      const hasMemeText = memeText.trim().length > 0;
+
+      if (hasMemeUrl === hasMemeText) {
+        throw new Error("Enter either an article URL or text, not both.");
+      }
+
+      const response = await fetch("/api/meme", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          language,
+          articleUrl: hasMemeUrl ? memeUrl.trim() : "",
+          text: hasMemeText ? memeText.trim() : "",
+        }),
+      });
+
+      const data = (await response.json()) as MemeResponse;
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to generate meme.");
+      }
+
+      if (!data.meme) {
+        throw new Error("The server did not return a meme.");
+      }
+
+      setMemeResult(data.meme);
+      setGenerationMode("meme");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleGenerate() {
+    if (inputMode === "meme") {
+      await handleGenerateMeme();
+      return;
+    }
+
+    await handleGenerateSlides();
+  }
+
   function proxiedImageUrl(imageUrl: string) {
     return `/api/image?url=${encodeURIComponent(imageUrl)}`;
   }
 
   function fallbackImageUrl(slide: GeneratedSlide, index: number) {
     const prompt = slide.imagePrompt || `${slide.title ?? ""} ${slide.text ?? ""}`.trim();
+
     return `instapost-generated://slide-${index + 1}/${encodeURIComponent(
       prompt || `carousel page ${index + 1}`,
     )}`;
@@ -110,18 +202,14 @@ export default function Home() {
 
   function slideBackgroundProxiedUrl(slide: GeneratedSlide, index: number) {
     const imageUrl = slide.imageUrl ?? "";
-    // Use the server-provided URL as-is. It carries the page prompt AND the
-    // whole-article topic (?topic=...) the image route needs to combine when
-    // searching for a background; rebuilding it here would drop the topic.
+
     if (!failedBackgrounds.has(index) && imageUrl) {
       return proxiedImageUrl(imageUrl);
     }
+
     return proxiedImageUrl(fallbackImageUrl(slide, index));
   }
 
-  // Pre-fetch backgrounds as base64 data URIs whenever slides or failedBackgrounds change.
-  // This is what makes html-to-image work — it reads img.src at capture time and needs
-  // a data: URI rather than a relative URL pointing to a server route.
   useEffect(() => {
     if (slides.length === 0) return;
 
@@ -129,31 +217,33 @@ export default function Home() {
 
     async function resolveOne(slide: GeneratedSlide, index: number): Promise<[number, string]> {
       const proxiedUrl = slideBackgroundProxiedUrl(slide, index);
+
       try {
-        const res = await fetch(proxiedUrl);
-        if (!res.ok) throw new Error("fetch failed");
-        const blob = await res.blob();
+        const response = await fetch(proxiedUrl);
+        if (!response.ok) throw new Error("fetch failed");
+
+        const blob = await response.blob();
+
         return await new Promise<[number, string]>((resolve, reject) => {
           const reader = new FileReader();
+
           reader.onload = () => resolve([index, reader.result as string]);
           reader.onerror = reject;
           reader.readAsDataURL(blob);
         });
       } catch {
-        // Empty string -> the <img> tag handles its own onError fallback.
         return [index, ""];
       }
     }
 
-    // Fetch backgrounds ONE AT A TIME. The free image provider allows only a
-    // single in-flight request per IP, so parallel fetches get rejected with
-    // "queue full". Resolve each slide as it arrives so images appear
-    // progressively instead of all at the end.
     async function resolveAll() {
       for (let index = 0; index < slides.length; index += 1) {
         if (cancelled) return;
+
         const [, dataUrl] = await resolveOne(slides[index], index);
+
         if (cancelled) return;
+
         if (dataUrl) {
           setResolvedBgUrls((current) => {
             const next = new Map(current);
@@ -169,7 +259,7 @@ export default function Home() {
     return () => {
       cancelled = true;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slides, failedBackgrounds]);
 
   function hasCjkText(value: string) {
@@ -178,10 +268,13 @@ export default function Home() {
 
   function truncateText(value: string | undefined, maxLength: number) {
     const cleaned = (value ?? "").replace(/\s+/g, " ").trim();
+
     if (cleaned.length <= maxLength) return cleaned;
+
     const sliced = cleaned.slice(0, Math.max(0, maxLength - 1)).trim();
     const lastSpace = sliced.lastIndexOf(" ");
     const shouldCutAtWord = lastSpace > maxLength * 0.62 && !hasCjkText(cleaned);
+
     return `${shouldCutAtWord ? sliced.slice(0, lastSpace) : sliced}…`;
   }
 
@@ -189,6 +282,7 @@ export default function Home() {
     const rawTitle = slide.title ?? "";
     const rawText = slide.text ?? "";
     const isCjk = hasCjkText(`${rawTitle} ${rawText}`);
+
     return {
       title: truncateText(rawTitle, isCjk ? 30 : 58),
       text: truncateText(rawText, isCjk ? 108 : 184),
@@ -203,7 +297,7 @@ export default function Home() {
     const textLength = slide.text?.length ?? 0;
     const longestWord = Math.max(
       0,
-      ...`${slide.title ?? ""} ${slide.text ?? ""}`.split(/\s+/).map((w) => w.length),
+      ...`${slide.title ?? ""} ${slide.text ?? ""}`.split(/\s+/).map((word) => word.length),
     );
     const totalLength = titleLength + textLength;
     const hasCjk = hasCjkText(`${slide.title ?? ""} ${slide.text ?? ""}`);
@@ -212,6 +306,7 @@ export default function Home() {
       hasCjk ? 33 : 34,
       Math.min(hasCjk ? 56 : 60, 60 - titleLength * (hasCjk ? 0.48 : 0.38)),
     );
+
     const textSize = Math.max(
       hasCjk ? 24 : 22,
       Math.min(
@@ -229,280 +324,425 @@ export default function Home() {
     } as CSSProperties;
   }
 
-  async function getSlidePng(index: number) {
-    const node = slideRefs.current[index];
-    if (!node) throw new Error(`Page ${index + 1} is not ready yet.`);
-
-    // Make sure every <img> in the slide (the background photo) is fully loaded
-    // and decoded before capture. html-to-image renders a clone and silently
-    // drops images that aren't ready yet — the cause of the blank background.
+  async function ensureImagesReady(node: HTMLElement) {
     const images = Array.from(node.querySelectorAll("img"));
+
     await Promise.all(
-      images.map(async (img) => {
-        if (!img.complete) {
-          await new Promise<void>((resolve) => {
-            img.addEventListener("load", () => resolve(), { once: true });
-            img.addEventListener("error", () => resolve(), { once: true });
-          });
-        }
-        try {
-          await img.decode();
-        } catch {
-          /* decode can reject for already-painted images; safe to ignore */
-        }
+      images.map(async (image) => {
+        if (image.complete && image.naturalWidth > 0) return;
+
+        await new Promise<void>((resolve) => {
+          image.onload = () => resolve();
+          image.onerror = () => resolve();
+        });
       }),
     );
 
-    // Capture the slide at its NATURAL on-screen layout and scale it up via
-    // pixelRatio so the output is a fixed 1080x1350 (x2 for crispness). Forcing
-    // width/height/style on the clone instead made the content keep its smaller
-    // on-screen size and sit in the top-left corner of an oversized canvas.
-    const rect = node.getBoundingClientRect();
-    const targetWidth = PAGE_WIDTH * 2; // 2160px wide -> 2160x2700 output
-    const pixelRatio = rect.width > 0 ? targetWidth / rect.width : 2;
-
-    const options = {
-      cacheBust: true,
-      pixelRatio,
-      backgroundColor: "#000000",
-    };
-
-    // The first capture frequently omits images while the cloned <img> elements
-    // load; rendering twice and keeping the second result is the documented
-    // html-to-image workaround for reliable image embedding.
-    await toPng(node, options);
-    return toPng(node, options);
+    await Promise.all(
+      images.map(async (image) => {
+        try {
+          await image.decode();
+        } catch {
+          // Ignore decode failures. html-to-image can still try to capture.
+        }
+      }),
+    );
   }
 
-  async function downloadOne(index: number) {
-    setError("");
-    try {
-      const png = await getSlidePng(index);
-      const link = document.createElement("a");
-      link.download = `instapost-page-${index + 1}.png`;
-      link.href = png;
-      link.click();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not download PNG.");
+  async function getSlidePng(index: number) {
+    const node = slideRefs.current[index];
+
+    if (!node) {
+      throw new Error(`Page ${index + 1} is not ready yet.`);
     }
+
+    await ensureImagesReady(node);
+
+    return toPng(node, {
+      cacheBust: true,
+      pixelRatio: 2,
+      width: PAGE_WIDTH,
+      height: Math.round(PAGE_WIDTH * 1.25),
+      style: {
+        width: `${PAGE_WIDTH}px`,
+        height: `${Math.round(PAGE_WIDTH * 1.25)}px`,
+      },
+    });
   }
 
-  async function downloadAllPngs() {
-    if (slides.length === 0) return;
+  async function downloadSlide(index: number) {
     setDownloading(true);
     setError("");
-    try {
-      const zip = new JSZip();
-      for (let index = 0; index < slides.length; index += 1) {
-        const png = await getSlidePng(index);
-        zip.file(
-          `instapost-page-${index + 1}.png`,
-          png.replace(/^data:image\/png;base64,/, ""),
-          { base64: true },
-        );
-      }
 
-      const blob = await zip.generateAsync({ type: "blob" });
-      saveAs(blob, "instapost-carousel-pngs.zip");
+    try {
+      const dataUrl = await getSlidePng(index);
+      saveAs(dataUrl, `instapost-page-${index + 1}.png`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not download PNGs.");
+      setError(err instanceof Error ? err.message : "Could not download page.");
     } finally {
       setDownloading(false);
     }
   }
 
+  async function downloadAllSlides() {
+    if (slides.length === 0) return;
+
+    setDownloading(true);
+    setError("");
+
+    try {
+      const zip = new JSZip();
+
+      for (let index = 0; index < slides.length; index += 1) {
+        const dataUrl = await getSlidePng(index);
+        const base64 = dataUrl.split(",")[1];
+        zip.file(`instapost-page-${index + 1}.png`, base64, { base64: true });
+      }
+
+      const blob = await zip.generateAsync({ type: "blob" });
+      saveAs(blob, "instapost-carousel.zip");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not download ZIP.");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  async function downloadMeme() {
+    const node = memeRef.current;
+
+    if (!node) {
+      setError("Meme is not ready yet.");
+      return;
+    }
+
+    setDownloading(true);
+    setError("");
+
+    try {
+      await ensureImagesReady(node);
+
+      const dataUrl = await toPng(node, {
+        cacheBust: true,
+        pixelRatio: 2,
+        width: PAGE_WIDTH,
+        height: Math.round(PAGE_WIDTH * 1.25),
+        style: {
+          width: `${PAGE_WIDTH}px`,
+          height: `${Math.round(PAGE_WIDTH * 1.25)}px`,
+        },
+      });
+
+      saveAs(dataUrl, "instapost-meme.png");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not download meme.");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  function handleMemeUrlChange(value: string) {
+    setMemeUrl(value);
+
+    if (value.trim().length > 0) {
+      setMemeText("");
+    }
+  }
+
+  function handleMemeTextChange(value: string) {
+    setMemeText(value);
+
+    if (value.trim().length > 0) {
+      setMemeUrl("");
+    }
+  }
+
   return (
-    <main className="min-h-screen px-5 py-8 text-white md:px-8">
-      <div className="mx-auto max-w-6xl">
-        <section className="mb-8 grid gap-8 lg:grid-cols-[1fr_440px] lg:items-start">
-          <div className="pt-4">
-            <p className="mb-3 text-xs font-black uppercase text-sky-200">
-              Instagram Carousel Generator
+    <main className="min-h-screen bg-[#f6f7fb] px-5 py-8 text-[#111827]">
+      <div className="mx-auto flex w-full max-w-6xl flex-col gap-8">
+        <section className="rounded-[32px] bg-white p-6 shadow-sm md:p-10">
+          <div className="mb-8 flex flex-col gap-3">
+            <p className="text-sm font-semibold uppercase tracking-[0.24em] text-[#667085]">
+              InstaPost
             </p>
-            <h1 className="max-w-3xl text-5xl font-black leading-none md:text-6xl">
-              Turn writing into Instagram-ready posts.
+            <h1 className="text-4xl font-black tracking-[-0.04em] md:text-6xl">
+              Generate Instagram posts from articles
             </h1>
-            <p className="mt-5 max-w-2xl text-lg leading-8 text-neutral-300">
-              Generate 4:5 carousel pages with contextual backgrounds, short
-              summaries, PNG downloads, and a PDF export.
+            <p className="max-w-2xl text-base leading-7 text-[#667085]">
+              Create carousel slides or one-page memes from an article link or long text.
             </p>
           </div>
 
-          <section className="rounded-2xl border border-white/10 bg-white/[0.055] p-5 shadow-2xl shadow-black/40 backdrop-blur">
-            <div className="mb-5 grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => setInputMode("url")}
-                className={`rounded-xl px-4 py-3 font-bold transition ${
-                  inputMode === "url"
-                    ? "bg-sky-200 text-neutral-950"
-                    : "bg-neutral-950 text-neutral-300"
-                }`}
-              >
-                Article Link
-              </button>
-              <button
-                type="button"
-                onClick={() => setInputMode("text")}
-                className={`rounded-xl px-4 py-3 font-bold transition ${
-                  inputMode === "text"
-                    ? "bg-sky-200 text-neutral-950"
-                    : "bg-neutral-950 text-neutral-300"
-                }`}
-              >
-                Long Text
-              </button>
-            </div>
+          <div className="mb-6 grid grid-cols-3 gap-2 rounded-2xl bg-[#f2f4f7] p-2">
+            <button
+              type="button"
+              onClick={() => changeInputMode("url")}
+              className={`rounded-xl px-4 py-3 text-sm font-bold transition ${
+                inputMode === "url" ? "bg-white shadow-sm" : "text-[#667085]"
+              }`}
+            >
+              Article Link
+            </button>
+            <button
+              type="button"
+              onClick={() => changeInputMode("text")}
+              className={`rounded-xl px-4 py-3 text-sm font-bold transition ${
+                inputMode === "text" ? "bg-white shadow-sm" : "text-[#667085]"
+              }`}
+            >
+              Long Text
+            </button>
+            <button
+              type="button"
+              onClick={() => changeInputMode("meme")}
+              className={`rounded-xl px-4 py-3 text-sm font-bold transition ${
+                inputMode === "meme" ? "bg-white shadow-sm" : "text-[#667085]"
+              }`}
+            >
+              Meme
+            </button>
+          </div>
 
-            {inputMode === "url" ? (
-              <label className="mb-5 block">
-                <span className="mb-2 block text-sm font-bold text-neutral-200">
-                  Article URL
-                </span>
+          <div className="grid gap-5">
+            {inputMode === "url" && (
+              <label className="grid gap-2">
+                <span className="text-sm font-bold">Article URL</span>
                 <input
                   value={url}
                   onChange={(event) => setUrl(event.target.value)}
                   placeholder="https://example.com/article"
-                  className="w-full rounded-xl border border-white/10 bg-neutral-950 px-4 py-3 text-white outline-none focus:border-sky-200"
-                />
-              </label>
-            ) : (
-              <label className="mb-5 block">
-                <span className="mb-2 block text-sm font-bold text-neutral-200">
-                  Long text
-                </span>
-                <textarea
-                  value={articleText}
-                  onChange={(event) => setArticleText(event.target.value)}
-                  placeholder="Paste the full article or long writing here..."
-                  rows={9}
-                  className="w-full resize-y rounded-xl border border-white/10 bg-neutral-950 px-4 py-3 leading-7 text-white outline-none focus:border-sky-200"
+                  className="rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827]"
                 />
               </label>
             )}
 
-            <div className="mb-5 grid gap-4 sm:grid-cols-2">
-              <label className="block">
-                <span className="mb-2 block text-sm font-bold text-neutral-200">
-                  Output language
-                </span>
+            {inputMode === "text" && (
+              <label className="grid gap-2">
+                <span className="text-sm font-bold">Long Text</span>
+                <textarea
+                  value={articleText}
+                  onChange={(event) => setArticleText(event.target.value)}
+                  placeholder="Paste at least 80 characters..."
+                  rows={10}
+                  className="resize-y rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827]"
+                />
+              </label>
+            )}
+
+            {inputMode === "meme" && (
+              <div className="grid gap-5">
+                <label className="grid gap-2">
+                  <span className="text-sm font-bold">Article URL</span>
+                  <input
+                    value={memeUrl}
+                    disabled={memeText.trim().length > 0}
+                    onChange={(event) => handleMemeUrlChange(event.target.value)}
+                    placeholder="Paste an article link"
+                    className="rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827] disabled:bg-[#f2f4f7] disabled:text-[#98a2b3]"
+                  />
+                </label>
+
+                <div className="text-center text-sm font-bold text-[#98a2b3]">or</div>
+
+                <label className="grid gap-2">
+                  <span className="text-sm font-bold">Text</span>
+                  <textarea
+                    value={memeText}
+                    disabled={memeUrl.trim().length > 0}
+                    onChange={(event) => handleMemeTextChange(event.target.value)}
+                    placeholder="Paste text to turn into a meme"
+                    rows={8}
+                    className="resize-y rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827] disabled:bg-[#f2f4f7] disabled:text-[#98a2b3]"
+                  />
+                </label>
+
+                <p className="rounded-2xl bg-[#f9fafb] p-4 text-sm leading-6 text-[#667085]">
+                  Meme mode creates one page only. It analyzes the article or text, detects the
+                  vibe, chooses a meme template, and writes a Korean or English meme caption.
+                </p>
+              </div>
+            )}
+
+            <div className="grid gap-4 md:grid-cols-2">
+              <label className="grid gap-2">
+                <span className="text-sm font-bold">Language</span>
                 <select
                   value={language}
                   onChange={(event) => setLanguage(event.target.value as OutputLanguage)}
-                  className="w-full rounded-xl border border-white/10 bg-neutral-950 px-4 py-3 text-white outline-none focus:border-sky-200"
+                  className="rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827]"
                 >
                   <option value="en">English</option>
                   <option value="ko">Korean</option>
                 </select>
               </label>
 
-              <label className="block">
-                <span className="mb-2 block text-sm font-bold text-neutral-200">
-                  Pages
-                </span>
-                <select
-                  value={pageCount}
-                  onChange={(event) => setPageCount(Number(event.target.value))}
-                  className="w-full rounded-xl border border-white/10 bg-neutral-950 px-4 py-3 text-white outline-none focus:border-sky-200"
-                >
-                  {PAGE_COUNT_OPTIONS.map((count) => (
-                    <option key={count} value={count}>
-                      {count} {count === 1 ? "page" : "pages"}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {inputMode !== "meme" && (
+                <label className="grid gap-2">
+                  <span className="text-sm font-bold">Pages</span>
+                  <select
+                    value={pageCount}
+                    onChange={(event) => setPageCount(Number(event.target.value))}
+                    className="rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827]"
+                  >
+                    {PAGE_COUNT_OPTIONS.map((count) => (
+                      <option key={count} value={count}>
+                        {count} page{count > 1 ? "s" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
             </div>
 
             <button
               type="button"
               onClick={handleGenerate}
               disabled={!canGenerate}
-              className="w-full rounded-xl bg-sky-200 px-5 py-3 font-black text-neutral-950 transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-2xl bg-[#111827] px-6 py-4 text-base font-black text-white transition hover:bg-black disabled:cursor-not-allowed disabled:bg-[#d0d5dd]"
             >
-              {loading ? "Generating..." : "Generate"}
+              {loading
+                ? inputMode === "meme"
+                  ? "Generating Meme..."
+                  : "Generating..."
+                : inputMode === "meme"
+                  ? "Generate Meme"
+                  : "Generate"}
             </button>
 
-            {generationMode ? (
-              <p className="mt-4 text-sm text-neutral-300">Mode: {generationMode}</p>
-            ) : null}
-
-            {warning ? (
-              <div className="mt-4 rounded-xl border border-yellow-400/30 bg-yellow-950/50 px-4 py-3 text-sm text-yellow-100">
-                {warning}
-              </div>
-            ) : null}
-
-            {error ? (
-              <div className="mt-4 rounded-xl border border-red-500/30 bg-red-950/70 px-4 py-3 text-sm text-red-100">
+            {error && (
+              <p className="rounded-2xl bg-[#fef3f2] p-4 text-sm font-bold text-[#d92d20]">
                 {error}
-              </div>
-            ) : null}
-          </section>
+              </p>
+            )}
+
+            {warning && (
+              <p className="rounded-2xl bg-[#fffaeb] p-4 text-sm font-bold text-[#b54708]">
+                {warning}
+              </p>
+            )}
+
+            {generationMode && (
+              <p className="text-sm font-semibold text-[#667085]">Mode: {generationMode}</p>
+            )}
+          </div>
         </section>
 
-        {slides.length > 0 ? (
-          <section className="mt-10">
-            <div className="mb-5 flex flex-col justify-between gap-4 md:flex-row md:items-end">
+        {inputMode === "meme" && memeResult && (
+          <section className="rounded-[32px] bg-white p-6 shadow-sm md:p-10">
+            <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
               <div>
-                <p className="mb-2 text-xs font-black uppercase text-sky-200">
-                  Generated Carousel
-                </p>
-                <h2 className="text-3xl font-black">Instagram post pages</h2>
+                <h2 className="text-2xl font-black tracking-[-0.03em]">Generated Meme</h2>
+
               </div>
 
-              <div className="flex flex-wrap gap-3">
-                <button
-                  type="button"
-                  onClick={downloadAllPngs}
-                  disabled={downloading}
-                  className="rounded-xl border border-white/15 bg-white/10 px-4 py-3 font-bold text-white disabled:opacity-50"
-                >
-                  Download PNGs
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={downloadMeme}
+                disabled={downloading}
+                className="rounded-2xl bg-[#111827] px-5 py-3 text-sm font-black text-white disabled:bg-[#d0d5dd]"
+              >
+                {downloading ? "Downloading..." : "Download Meme PNG"}
+              </button>
             </div>
 
-            <div className="grid gap-6 md:grid-cols-2">
+            <div className="flex justify-center">
+              <div
+                ref={memeRef}
+                className="relative aspect-[4/5] w-full max-w-[480px] overflow-hidden rounded-[28px] bg-black shadow-2xl"
+              >
+                <img
+                  src={`${memeResult.imageUrl}&t=${Date.now()}`}
+                  alt={memeResult.templateName}
+                  className="h-full w-full object-cover"
+                />
+
+                <div className="absolute left-1/2 top-[5%] w-[92%] -translate-x-1/2 text-center text-[clamp(28px,6vw,56px)] font-black uppercase leading-[1.05] tracking-[-0.04em] text-white [text-shadow:3px_3px_0_#000,-3px_3px_0_#000,3px_-3px_0_#000,-3px_-3px_0_#000,0_3px_0_#000,3px_0_0_#000,0_-3px_0_#000,-3px_0_0_#000]">
+                  {memeResult.topText}
+                </div>
+
+                <div className="absolute bottom-[5%] left-1/2 w-[92%] -translate-x-1/2 text-center text-[clamp(28px,6vw,56px)] font-black uppercase leading-[1.05] tracking-[-0.04em] text-white [text-shadow:3px_3px_0_#000,-3px_3px_0_#000,3px_-3px_0_#000,-3px_-3px_0_#000,0_3px_0_#000,3px_0_0_#000,0_-3px_0_#000,-3px_0_0_#000]">
+                  {memeResult.bottomText}
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {slides.length > 0 && (
+          <section className="rounded-[32px] bg-white p-6 shadow-sm md:p-10">
+            <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h2 className="text-2xl font-black tracking-[-0.03em]">Generated Carousel</h2>
+                <p className="mt-2 text-sm text-[#667085]">
+                  {slides.length} page{slides.length > 1 ? "s" : ""} ready.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={downloadAllSlides}
+                disabled={downloading}
+                className="rounded-2xl bg-[#111827] px-5 py-3 text-sm font-black text-white disabled:bg-[#d0d5dd]"
+              >
+                {downloading ? "Downloading..." : "Download ZIP"}
+              </button>
+            </div>
+
+            <div className="grid gap-8 md:grid-cols-2">
               {slides.map((slide, index) => {
                 const fittedSlide = getFittedSlide(slide);
-                // Only the data URI resolved sequentially in resolveAll is used
-                // as the <img> src. We deliberately do NOT point the <img> at the
-                // /api/image route directly: that would make every slide fetch in
-                // parallel and trip the image provider's 1-request-per-IP limit.
-                const bgUrl = resolvedBgUrls.get(index) ?? "";
+                const bgUrl = resolvedBgUrls.get(index);
+                const textStyle = getSlideTextStyle(fittedSlide);
 
                 return (
-                  <article key={`${fittedSlide.title}-${index}`} className="grid gap-3">
+                  <article key={index} className="grid gap-3">
                     <div
-                      ref={(element) => {
-                        slideRefs.current[index] = element;
+                      ref={(node) => {
+                        slideRefs.current[index] = node;
                       }}
-                      className="relative aspect-[4/5] w-full overflow-hidden bg-neutral-900 shadow-2xl shadow-black/50"
+                      className="relative aspect-[4/5] w-full overflow-hidden rounded-[28px] bg-[#111827] shadow-xl"
+                      style={{
+                        width: "100%",
+                      }}
                     >
                       {bgUrl ? (
                         <img
-                          alt=""
-                          aria-hidden="true"
-                          className="absolute inset-0 h-full w-full scale-[1.03] object-cover"
                           src={bgUrl}
+                          alt=""
+                          className="absolute inset-0 h-full w-full object-cover"
+                          onError={() => {
+                            setFailedBackgrounds((current) => {
+                              const next = new Set(current);
+                              next.add(index);
+                              return next;
+                            });
+                          }}
                         />
                       ) : (
-                        <div className="absolute inset-0 flex items-center justify-center bg-neutral-900 text-xs font-bold text-neutral-500">
-                          Generating background…
-                        </div>
+                        <div className="absolute inset-0 bg-gradient-to-br from-[#111827] to-[#475467]" />
                       )}
-                      <div className="absolute inset-0 bg-gradient-to-b from-black/0 via-black/10 to-black/78" />
-                      <div className="absolute inset-x-0 bottom-0 h-[48%] bg-gradient-to-t from-black/70 via-black/30 to-transparent" />
+
+                      <div className="absolute inset-0 bg-black/45" />
 
                       <div
-                        className="absolute bottom-[10%] left-[6%] right-[6%] max-h-[58%] overflow-hidden"
-                        style={getSlideTextStyle(fittedSlide)}
+                        className="absolute inset-x-[7%] bottom-[7%] top-[7%] flex flex-col justify-end gap-5 text-white"
+                        style={textStyle}
                       >
-                        <h3 className="mb-7 text-[length:var(--title-size)] font-black leading-[1.08] text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.65)]">
+                        <h3
+                          className="font-black leading-[1.05] tracking-[-0.05em]"
+                          style={{
+                            fontSize: "var(--title-size)",
+                          }}
+                        >
                           {fittedSlide.title}
                         </h3>
-                        <p className="whitespace-pre-wrap text-[length:var(--text-size)] font-black leading-[1.24] text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.65)]">
+
+                        <p
+                          className="font-semibold leading-[1.22] tracking-[-0.03em]"
+                          style={{
+                            fontSize: "var(--text-size)",
+                          }}
+                        >
                           {fittedSlide.text}
                         </p>
                       </div>
@@ -510,8 +750,9 @@ export default function Home() {
 
                     <button
                       type="button"
-                      onClick={() => downloadOne(index)}
-                      className="rounded-xl bg-sky-200 px-4 py-3 font-black text-neutral-950"
+                      onClick={() => downloadSlide(index)}
+                      disabled={downloading}
+                      className="rounded-2xl border border-[#d0d5dd] bg-white px-4 py-3 text-sm font-black disabled:text-[#98a2b3]"
                     >
                       Download Page {index + 1}
                     </button>
@@ -520,7 +761,7 @@ export default function Home() {
               })}
             </div>
           </section>
-        ) : null}
+        )}
       </div>
     </main>
   );
