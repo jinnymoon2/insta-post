@@ -503,6 +503,13 @@ export default function Home() {
       throw new Error("Could not create image canvas.");
     }
 
+    // Fill the full rectangular canvas first.
+    // This guarantees sharp 90-degree PNG corners instead of rounded card corners.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, canvas.width, canvas.height);
+    ctx.clip();
+
     ctx.fillStyle = "#111827";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -539,6 +546,8 @@ export default function Home() {
       title: fittedSlide.title || "",
       body: fittedSlide.text || "",
     });
+
+    ctx.restore();
 
     return canvas.toDataURL("image/png");
   }
