@@ -31,13 +31,23 @@ type MemeResult = {
   sourceSummary: string;
   keywords: string[];
   vibe: string;
+  contentBrief?: {
+    topic: string;
+    subject: string;
+    actor: string;
+    change: string;
+    conflict: string;
+    consequence: string;
+    jokeAngle: string;
+    emotion: string;
+    templateIntent: string;
+  };
   templateId: string;
   templateName: string;
   imageUrl: string;
   imageSource: "imgflip" | "korean-web-meme" | "pexels";
   searchQuery: string;
-  captionSearchQuery?: string;
-  captionInspiration?: string[];
+  preferredTemplates?: string[];
   topText: string;
   bottomText: string;
 };
@@ -351,25 +361,186 @@ export default function Home() {
     );
   }
 
-  async function getSlidePng(index: number) {
-    const node = slideRefs.current[index];
+  async function imageUrlToDataUrl(url: string) {
+    const response = await fetch(url, { cache: "no-store" });
 
-    if (!node) {
+    if (!response.ok) {
+      throw new Error(`Could not load background image. Status: ${response.status}`);
+    }
+
+    const blob = await response.blob();
+
+    return await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error("Could not read background image."));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function loadCanvasImage(src: string) {
+    return await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Could not load background image for canvas export."));
+      image.src = src;
+    });
+  }
+
+  function wrapCanvasText(
+    ctx: CanvasRenderingContext2D,
+    text: string,
+    maxWidth: number,
+    maxLines: number,
+  ) {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    const words = normalized.includes(" ") ? normalized.split(" ") : [...normalized];
+
+    const lines: string[] = [];
+    let currentLine = "";
+
+    for (const word of words) {
+      const separator = normalized.includes(" ") ? " " : "";
+      const testLine = currentLine ? `${currentLine}${separator}${word}` : word;
+
+      if (ctx.measureText(testLine).width <= maxWidth) {
+        currentLine = testLine;
+        continue;
+      }
+
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+
+      if (lines.length >= maxLines) break;
+    }
+
+    if (currentLine && lines.length < maxLines) {
+      lines.push(currentLine);
+    }
+
+    if (lines.length === maxLines && words.length > 0) {
+      const lastIndex = lines.length - 1;
+      while (ctx.measureText(`${lines[lastIndex]}…`).width > maxWidth && lines[lastIndex].length > 1) {
+        lines[lastIndex] = lines[lastIndex].slice(0, -1);
+      }
+      lines[lastIndex] = `${lines[lastIndex]}…`;
+    }
+
+    return lines;
+  }
+
+  function drawCanvasTextBlock({
+    ctx,
+    title,
+    body,
+  }: {
+    ctx: CanvasRenderingContext2D;
+    title: string;
+    body: string;
+  }) {
+    const left = PAGE_WIDTH * 0.07;
+    const maxWidth = PAGE_WIDTH * 0.86;
+    const bottom = PAGE_WIDTH * 0.09;
+
+    const titleLength = [...title].length;
+    const bodyLength = [...body].length;
+
+    const titleSize = titleLength > 34 ? 70 : titleLength > 24 ? 78 : 88;
+    const bodySize = bodyLength > 95 ? 46 : bodyLength > 65 ? 52 : 58;
+
+    ctx.fillStyle = "#ffffff";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+
+    ctx.font = `900 ${titleSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    const titleLines = wrapCanvasText(ctx, title, maxWidth, 3);
+    const titleLineHeight = titleSize * 1.08;
+
+    ctx.font = `700 ${bodySize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    const bodyLines = wrapCanvasText(ctx, body, maxWidth, 4);
+    const bodyLineHeight = bodySize * 1.22;
+
+    const gap = 42;
+    const totalHeight =
+      titleLines.length * titleLineHeight +
+      gap +
+      bodyLines.length * bodyLineHeight;
+
+    let y = PAGE_WIDTH * 1.25 - bottom - totalHeight;
+
+    ctx.font = `900 ${titleSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    for (const line of titleLines) {
+      ctx.fillText(line, left, y);
+      y += titleLineHeight;
+    }
+
+    y += gap;
+
+    ctx.font = `700 ${bodySize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    for (const line of bodyLines) {
+      ctx.fillText(line, left, y);
+      y += bodyLineHeight;
+    }
+  }
+
+  async function getSlidePng(index: number) {
+    const slide = slides[index];
+
+    if (!slide) {
       throw new Error(`Page ${index + 1} is not ready yet.`);
     }
 
-    await ensureImagesReady(node);
+    const fittedSlide = getFittedSlide(slide);
+    const bgUrl = resolvedBgUrls.get(index);
 
-    return toPng(node, {
-      cacheBust: true,
-      pixelRatio: 2,
-      width: PAGE_WIDTH,
-      height: Math.round(PAGE_WIDTH * 1.25),
-      style: {
-        width: `${PAGE_WIDTH}px`,
-        height: `${Math.round(PAGE_WIDTH * 1.25)}px`,
-      },
+    const canvas = document.createElement("canvas");
+    canvas.width = PAGE_WIDTH;
+    canvas.height = Math.round(PAGE_WIDTH * 1.25);
+
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx) {
+      throw new Error("Could not create image canvas.");
+    }
+
+    ctx.fillStyle = "#111827";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    if (bgUrl) {
+      const dataUrl = await imageUrlToDataUrl(bgUrl);
+      const image = await loadCanvasImage(dataUrl);
+
+      const canvasRatio = canvas.width / canvas.height;
+      const imageRatio = image.width / image.height;
+
+      let drawWidth = canvas.width;
+      let drawHeight = canvas.height;
+      let drawX = 0;
+      let drawY = 0;
+
+      if (imageRatio > canvasRatio) {
+        drawHeight = canvas.height;
+        drawWidth = drawHeight * imageRatio;
+        drawX = (canvas.width - drawWidth) / 2;
+      } else {
+        drawWidth = canvas.width;
+        drawHeight = drawWidth / imageRatio;
+        drawY = (canvas.height - drawHeight) / 2;
+      }
+
+      ctx.drawImage(image, drawX, drawY, drawWidth, drawHeight);
+    }
+
+    ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    drawCanvasTextBlock({
+      ctx,
+      title: fittedSlide.title || "",
+      body: fittedSlide.text || "",
     });
+
+    return canvas.toDataURL("image/png");
   }
 
   async function downloadSlide(index: number) {
@@ -708,16 +879,14 @@ export default function Home() {
                       }}
                     >
                       {bgUrl ? (
-                        <img
-                          src={bgUrl}
-                          alt=""
-                          className="absolute inset-0 h-full w-full object-cover"
-                          onError={() => {
-                            setFailedBackgrounds((current) => {
-                              const next = new Set(current);
-                              next.add(index);
-                              return next;
-                            });
+                        <div
+                          data-slide-background
+                          className="absolute inset-0"
+                          style={{
+                            backgroundImage: `url("${bgUrl}")`,
+                            backgroundSize: "cover",
+                            backgroundPosition: "center",
+                            backgroundRepeat: "no-repeat",
                           }}
                         />
                       ) : (

@@ -47,90 +47,57 @@ function normalize(value: string) {
     .trim();
 }
 
-function scoreImgflipMeme(meme: ImgflipMeme, query: string) {
+function parsePreferredTemplates(value: string | null) {
+  return (value || "")
+    .split(",")
+    .map((item) => normalize(item))
+    .filter(Boolean);
+}
+
+function scoreImgflipMeme(meme: ImgflipMeme, query: string, preferredTemplates: string[]) {
   const normalizedName = normalize(meme.name);
   const normalizedQuery = normalize(query);
-  const queryWords = normalizedQuery.split(" ").filter(Boolean);
+  const queryWords = normalizedQuery.split(" ").filter((word) => word.length >= 4);
 
   let score = 0;
 
+  for (const preferred of preferredTemplates) {
+    if (preferred && normalizedName.includes(preferred)) {
+      score += 100;
+    }
+  }
+
   for (const word of queryWords) {
     if (normalizedName.includes(word)) {
-      score += 5;
+      score += 4;
     }
   }
 
-  const famousTemplateBoosts: Array<{
-    patterns: RegExp[];
-    templateNames: RegExp[];
-    boost: number;
-  }> = [
-    {
-      patterns: [/ai|automation|changed the game|new era|tool/i],
-      templateNames: [/drake|two buttons|change my mind|expanding brain|buff doge/i],
-      boost: 30,
-    },
-    {
-      patterns: [/developer|programmer|code|bug|debug|deploy|engineering/i],
-      templateNames: [/one does not simply|two buttons|disaster girl|drake|gru/i],
-      boost: 30,
-    },
-    {
-      patterns: [/office|company|manager|meeting|deadline|corporate/i],
-      templateNames: [/distracted boyfriend|drake|change my mind|one does not simply/i],
-      boost: 28,
-    },
-    {
-      patterns: [/shock|surprise|unexpected|plot twist|breaking news/i],
-      templateNames: [/surprised pikachu|disaster girl|this is fine|monkey puppet/i],
-      boost: 35,
-    },
-    {
-      patterns: [/success|win|growth|launch|celebrating/i],
-      templateNames: [/success kid|leonardo dicaprio cheers|drake/i],
-      boost: 35,
-    },
-    {
-      patterns: [/failure|problem|risk|crisis|pain|harder than expected/i],
-      templateNames: [/this is fine|sad pablo escobar|hide the pain harold|first time/i],
-      boost: 35,
-    },
-    {
-      patterns: [/confused|understand|what just happened/i],
-      templateNames: [/confused nick young|math lady|monkey puppet|two buttons/i],
-      boost: 35,
-    },
-    {
-      patterns: [/truth|revealed|secret|actually|turns out/i],
-      templateNames: [/always has been|change my mind|ancient aliens/i],
-      boost: 35,
-    },
-    {
-      patterns: [/trend|keep up|fast|shift|transition/i],
-      templateNames: [/distracted boyfriend|drake|running away balloon|bike fall/i],
-      boost: 30,
-    },
+  const famousNames = [
+    "drake",
+    "distracted boyfriend",
+    "two buttons",
+    "change my mind",
+    "one does not simply",
+    "success kid",
+    "this is fine",
+    "surprised pikachu",
+    "expanding brain",
+    "disaster girl",
+    "hide the pain",
+    "monkey puppet",
+    "always has been",
+    "gru",
+    "buff doge",
+    "running away balloon",
+    "bike fall",
+    "math lady",
   ];
 
-  for (const boostRule of famousTemplateBoosts) {
-    const queryMatches = boostRule.patterns.some((pattern) => pattern.test(normalizedQuery));
-    const nameMatches = boostRule.templateNames.some((pattern) => pattern.test(normalizedName));
-
-    if (queryMatches && nameMatches) {
-      score += boostRule.boost;
-    }
+  if (famousNames.some((name) => normalizedName.includes(name))) {
+    score += 20;
   }
 
-  // General famous-template preference.
-  if (
-    /drake|distracted boyfriend|two buttons|change my mind|one does not simply|success kid|this is fine|surprised pikachu|expanding brain|disaster girl|hide the pain/i.test(
-      normalizedName,
-    )
-  ) {
-    score += 12;
-  }
-
-  // Prefer templates with standard meme caption boxes.
   if (meme.box_count >= 2) {
     score += 5;
   }
@@ -138,7 +105,7 @@ function scoreImgflipMeme(meme: ImgflipMeme, query: string) {
   return score;
 }
 
-async function fetchImgflipMemeUrl(query: string) {
+async function fetchImgflipMemeUrl(query: string, preferredTemplates: string[]) {
   const response = await fetch("https://api.imgflip.com/get_memes", {
     cache: "no-store",
   });
@@ -155,7 +122,7 @@ async function fetchImgflipMemeUrl(query: string) {
   }
 
   const selected = [...memes].sort((a, b) => {
-    return scoreImgflipMeme(b, query) - scoreImgflipMeme(a, query);
+    return scoreImgflipMeme(b, query, preferredTemplates) - scoreImgflipMeme(a, query, preferredTemplates);
   })[0];
 
   if (!selected?.url) {
@@ -245,7 +212,7 @@ async function fetchKoreanFamousMemeUrl(query: string) {
 
     const combined = `${title} ${url} ${image}`;
 
-    return /밈|짤|meme|reaction|웃긴|유명/i.test(combined);
+    return /밈|짤|meme|reaction|웃긴|유명|무한도전|박명수|유재석|이왜진|당황|충격/i.test(combined);
   });
 
   if (!firstUsable || typeof firstUsable !== "object") {
@@ -361,6 +328,7 @@ export async function GET(req: Request) {
   const query = searchParams.get("q")?.trim() || "";
   const language = searchParams.get("language") || "en";
   const source = searchParams.get("source") || "imgflip";
+  const preferredTemplates = parsePreferredTemplates(searchParams.get("preferred"));
 
   if (!query) {
     return jsonError("Missing meme search query.", 400);
@@ -370,7 +338,7 @@ export async function GET(req: Request) {
     let imageUrl = "";
 
     if (language === "en" && source === "imgflip") {
-      imageUrl = await fetchImgflipMemeUrl(query);
+      imageUrl = await fetchImgflipMemeUrl(query, preferredTemplates);
     } else if (language === "ko" && source === "korean-web-meme") {
       imageUrl = await fetchKoreanFamousMemeUrl(query);
     }

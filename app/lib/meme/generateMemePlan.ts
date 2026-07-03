@@ -1,6 +1,6 @@
-import { fetchCaptionInspiration } from "./captionInspiration";
 import {
   buildMemeSearchQuery,
+  MemeContentBrief,
   MemeImageSource,
   MemeLanguage,
 } from "./templates";
@@ -10,13 +10,13 @@ export type MemePlan = {
   sourceSummary: string;
   keywords: string[];
   vibe: string;
+  contentBrief: MemeContentBrief;
   templateId: string;
   templateName: string;
   imageUrl: string;
   imageSource: MemeImageSource;
   searchQuery: string;
-  captionSearchQuery: string;
-  captionInspiration: string[];
+  preferredTemplates: string[];
   topText: string;
   bottomText: string;
 };
@@ -37,13 +37,21 @@ function normalizeText(text: string) {
     .slice(0, 6000);
 }
 
+function sentenceSplit(text: string) {
+  return text
+    .replace(/\s+/g, " ")
+    .split(/(?<=[.!?。！？])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 20);
+}
+
 function extractKeywords(text: string, language: MemeLanguage) {
   const cleaned = text
     .replace(/&#x27;/g, " ")
     .replace(/&#39;/g, " ")
     .replace(/&quot;/g, " ")
     .replace(/&amp;/g, " ")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/[^\p{L}\p{N}\s.-]/gu, " ")
     .split(/\s+/)
     .filter(Boolean);
 
@@ -76,6 +84,10 @@ function extractKeywords(text: string, language: MemeLanguage) {
           "또",
           "때",
           "중",
+          "및",
+          "등을",
+          "통해",
+          "위해",
         ])
       : new Set([
           "the",
@@ -119,6 +131,11 @@ function extractKeywords(text: string, language: MemeLanguage) {
           "is",
           "a",
           "an",
+          "by",
+          "be",
+          "can",
+          "new",
+          "said",
           "x27",
           "quot",
           "amp",
@@ -138,130 +155,32 @@ function extractKeywords(text: string, language: MemeLanguage) {
 
   return [...counts.entries()]
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
+    .slice(0, 12)
     .map(([word]) => word);
 }
 
-function detectDynamicVibe(text: string, language: MemeLanguage) {
-  const lower = text.toLowerCase();
-
-  const vibeSignals: Array<{
-    vibe: string;
-    patterns: RegExp[];
-  }> =
-    language === "ko"
-      ? [
-          {
-            vibe: "AI 때문에 살짝 위협받는 개발자 느낌",
-            patterns: [/ai|인공지능|생성형|gpt|llm|모델/i],
-          },
-          {
-            vibe: "개발하다가 예상 못 한 버그를 만난 느낌",
-            patterns: [/개발|코드|버그|배포|깃허브|프론트엔드|백엔드|api/i],
-          },
-          {
-            vibe: "회사에서 갑자기 일이 커지는 느낌",
-            patterns: [/회사|업무|마감|회의|담당|요청|프로젝트/i],
-          },
-          {
-            vibe: "뉴스 보고 어이없어서 멈춘 느낌",
-            patterns: [/뉴스|발표|논란|정책|규제|이슈/i],
-          },
-          {
-            vibe: "생각보다 일이 너무 잘 풀려서 당황한 느낌",
-            patterns: [/성공|성장|돌파|출시|기록|인기|확산/i],
-          },
-          {
-            vibe: "처음엔 쉬워 보였는데 현실은 어려운 느낌",
-            patterns: [/문제|위기|실패|하락|리스크|복잡|어려/i],
-          },
-          {
-            vibe: "갑자기 판이 바뀌어서 충격받은 느낌",
-            patterns: [/충격|반전|갑자기|놀라운|예상 밖|실화/i],
-          },
-          {
-            vibe: "모두가 조용히 눈치 보는 느낌",
-            patterns: [/불확실|걱정|우려|긴장|위험/i],
-          },
-          {
-            vibe: "혼자만 진실을 알아버린 느낌",
-            patterns: [/사실|진실|알고 보니|결국|드러/i],
-          },
-          {
-            vibe: "트렌드를 따라가야 해서 바쁜 느낌",
-            patterns: [/트렌드|유행|빠르게|변화|전환|새로운/i],
-          },
-        ]
-      : [
-          {
-            vibe: "developer realizing AI changed the game",
-            patterns: [/ai|artificial intelligence|gpt|llm|model|automation/i],
-          },
-          {
-            vibe: "programmer finding an unexpected bug",
-            patterns: [/developer|code|bug|github|deploy|api|frontend|backend/i],
-          },
-          {
-            vibe: "office worker watching a simple task become complicated",
-            patterns: [/company|office|meeting|manager|deadline|project|enterprise/i],
-          },
-          {
-            vibe: "person shocked by breaking tech news",
-            patterns: [/news|announcement|policy|regulation|controversy|issue/i],
-          },
-          {
-            vibe: "person celebrating an unexpected win",
-            patterns: [/success|growth|launch|record|win|popular|viral/i],
-          },
-          {
-            vibe: "person realizing reality is harder than expected",
-            patterns: [/problem|risk|crisis|failure|decline|difficult|complex/i],
-          },
-          {
-            vibe: "person processing a plot twist",
-            patterns: [/shock|surprise|unexpected|suddenly|plot twist|real/i],
-          },
-          {
-            vibe: "everyone quietly panicking",
-            patterns: [/uncertain|worry|concern|fear|threat|danger/i],
-          },
-          {
-            vibe: "person who just discovered the hidden truth",
-            patterns: [/truth|actually|turns out|revealed|secret|finally/i],
-          },
-          {
-            vibe: "person trying to keep up with a fast trend",
-            patterns: [/trend|fast|change|shift|new era|transition/i],
-          },
-        ];
-
-  const matchedVibes = vibeSignals
-    .filter((signal) => signal.patterns.some((pattern) => pattern.test(lower)))
-    .map((signal) => signal.vibe);
-
-  if (matchedVibes.length > 0) {
-    return matchedVibes.slice(0, 2).join(" + ");
+function findFirstMatch(text: string, patterns: RegExp[]) {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
   }
 
-  const hasQuestion = lower.includes("?") || /(why|how|what|왜|어떻게|무슨)/i.test(text);
-
-  if (language === "ko") {
-    return hasQuestion
-      ? "상황을 이해하려고 애쓰는 당황한 느낌"
-      : "뉴스를 보고 반응을 숨기지 못하는 느낌";
-  }
-
-  return hasQuestion
-    ? "confused person trying to understand what just happened"
-    : "person reacting dramatically to unexpected news";
+  return "";
 }
 
-function pickRandom<T>(items: T[], fallback: T) {
-  if (items.length === 0) return fallback;
-  return items[Math.floor(Math.random() * items.length)] ?? fallback;
+function titleCase(value: string) {
+  return value
+    .split(/\s+/)
+    .map((word) => {
+      if (word.length <= 2) return word;
+      return `${word[0]?.toUpperCase() ?? ""}${word.slice(1)}`;
+    })
+    .join(" ");
 }
 
-function shorten(value: string, maxLength: number) {
+function short(value: string, maxLength: number) {
   const cleaned = value.replace(/\s+/g, " ").trim();
 
   if (cleaned.length <= maxLength) return cleaned;
@@ -269,148 +188,174 @@ function shorten(value: string, maxLength: number) {
   return `${cleaned.slice(0, maxLength - 1).trim()}…`;
 }
 
-function extractShortInspiration(phrases: string[], language: MemeLanguage) {
-  const cleaned = phrases
-    .map((phrase) =>
-      phrase
-        .replace(/\s+/g, " ")
-        .replace(/^[^a-zA-Z가-힣0-9]+/, "")
-        .replace(/[^a-zA-Z가-힣0-9?!'"“”‘’.,\s-]+$/g, "")
-        .trim(),
-    )
-    .filter((phrase) => phrase.length >= 12 && phrase.length <= 120);
+function extractContentBrief(text: string, language: MemeLanguage, keywords: string[]): MemeContentBrief {
+  const sentences = sentenceSplit(text);
+  const firstSentence = sentences[0] || text.slice(0, 220);
+  const lower = text.toLowerCase();
 
-  const selected = pickRandom(
-    cleaned,
-    language === "ko" ? "이게 진짜 요즘 상황" : "This is literally the situation",
-  );
+  const mainKeyword = keywords[0] || (language === "ko" ? "이 이슈" : "this issue");
+  const secondKeyword = keywords[1] || (language === "ko" ? "변화" : "the change");
 
-  return shorten(selected, language === "ko" ? 36 : 48);
-}
+  const actor =
+    findFirstMatch(text, [
+      /([A-Z][A-Za-z0-9 .-]{1,40})\s+(?:announced|released|launched|introduced|built|created|plans|said)/,
+      /([가-힣A-Za-z0-9 .-]{2,30})이\s+(?:발표|출시|공개|도입|시작)/,
+      /([가-힣A-Za-z0-9 .-]{2,30})가\s+(?:발표|출시|공개|도입|시작)/,
+    ]) || mainKeyword;
 
-function makeCaption({
-  language,
-  vibe,
-  keywords,
-  inspirationPhrases,
-}: {
-  language: MemeLanguage;
-  vibe: string;
-  keywords: string[];
-  inspirationPhrases: string[];
-}) {
-  const main = keywords[0] || (language === "ko" ? "이 뉴스" : "this update");
-  const second = keywords[1] || (language === "ko" ? "현실" : "reality");
-  const third = keywords[2] || (language === "ko" ? "상황" : "the situation");
-  const inspiration = extractShortInspiration(inspirationPhrases, language);
-  const vibeLower = vibe.toLowerCase();
+  let topic = short(firstSentence, language === "ko" ? 42 : 64);
+  let subject = mainKeyword;
+  let change = secondKeyword;
+  let conflict = language === "ko" ? "예상보다 일이 커짐" : "it becomes more complicated than expected";
+  let consequence = language === "ko" ? "모두가 당황함" : "everyone has to react";
+  let emotion = language === "ko" ? "당황한 반응" : "confused reaction";
+  let templateIntent = language === "ko" ? "상황 반전 밈" : "plot twist reaction meme";
 
-  const randomSeed = Math.floor(Math.random() * 1000000);
-  const variant = randomSeed % 12;
-
-  if (language === "ko") {
-    const topOptions = [
-      `${main} 보기 전의 나`,
-      `나: ${main} 별거 아니겠지`,
-      `처음엔 ${main} 그냥 넘겼는데`,
-      `사람들: ${main} 또 나온 거 아님?`,
-      `${main} 소식 들은 내 표정`,
-      `오늘의 인터넷: ${main}`,
-      `내가 이해한 ${main}`,
-      `아직 ${second} 모르는 나`,
-      inspiration,
-      `${third} 설명 들은 후`,
-      `분명 간단한 얘기였는데`,
-      `이쯤 되면 ${main}이 주인공`,
-    ];
-
-    const bottomOptions = [
-      `현실: 전혀 간단하지 않았음`,
-      `알고 보니 ${second}가 핵심이었음`,
-      `그리고 하루가 사라졌습니다`,
-      `근데 이제 진짜 문제가 시작됨`,
-      `나만 이렇게 이해한 거 아니죠?`,
-      `이게 바로 요즘 밈이 되는 과정`,
-      `결론: 생각보다 더 심각함`,
-      `그래서 이제 ${third}도 바뀐다고요?`,
-      `웃긴데 안 웃김`,
-      `인터넷은 이미 반응 중`,
-      `잠깐만요 이게 실화라고요?`,
-      `이제 모른 척 못 함`,
-    ];
-
-    if (vibe.includes("AI") || vibeLower.includes("ai")) {
-      bottomOptions.push(
-        "AI 업계: 아니요, 판이 바뀌었습니다",
-        "개발자들: 웃고 있지만 눈은 안 웃음",
-        "편해진 건 맞는데 마음은 불편함",
-      );
-    }
-
-    if (vibe.includes("개발") || vibe.includes("버그")) {
-      bottomOptions.push(
-        "현실: 디버깅 파티 시작",
-        "개발자: 왜 또 나야",
-        "간단한 수정이 아니었습니다",
-      );
-    }
-
-    return {
-      topText: pickRandom(topOptions, `${main} 보기 전의 나`),
-      bottomText: pickRandom(bottomOptions, `현실: ${second} 때문에 하루 삭제`),
-    };
+  if (/(ai|artificial intelligence|gpt|llm|agent|automation|인공지능|생성형|에이전트|자동화)/i.test(text)) {
+    subject = language === "ko" ? `${mainKeyword} AI 변화` : `${titleCase(mainKeyword)} AI shift`;
+    change = language === "ko" ? "AI가 일을 대신하기 시작함" : "AI starts doing the work";
+    conflict = language === "ko" ? "편해졌는데 내 역할이 흔들림" : "it is useful, but everyone's role suddenly feels less safe";
+    consequence = language === "ko" ? "개발자들이 웃으면서 긴장함" : "developers are laughing nervously";
+    emotion = language === "ko" ? "불안한 웃음" : "nervous laughter";
+    templateIntent = language === "ko" ? "AI 때문에 당황한 개발자 밈" : "developer nervous about AI meme";
   }
 
-  const topOptions = [
-    `Me before reading about ${main}`,
-    `Me: "${main} is probably simple"`,
-    `Everyone acting normal about ${main}`,
-    `The internet seeing ${main}`,
-    `Me trying to understand ${main}`,
-    `Before ${second} entered the chat`,
-    inspiration,
-    `Nobody:`,
-    `The article: "${main}"`,
-    `Me opening the article for 2 seconds`,
-    `When ${main} sounds harmless`,
-    `POV: you just learned about ${main}`,
-  ];
-
-  const bottomOptions = [
-    `Reality: it was not simple`,
-    `Also reality: ${second} changed everything`,
-    `And somehow this is my problem now`,
-    `The comments are already writing themselves`,
-    `That aged badly in record time`,
-    `Nobody is safe from ${third}`,
-    `The plot twist has entered the chat`,
-    `Internet reaction: completely reasonable panic`,
-    `I laughed, then realized it was serious`,
-    `So we are all pretending this is fine?`,
-    `This is how the meme economy begins`,
-    `Wait, that's actually real?`,
-  ];
-
-  if (vibeLower.includes("ai")) {
-    bottomOptions.push(
-      `AI industry: "That aged badly."`,
-      `Developers laughing nervously in the corner`,
-      `Cool feature. Slight existential crisis.`,
-    );
+  if (/(developer|code|bug|github|deploy|api|frontend|backend|programmer|개발|코드|버그|배포|깃허브|프론트엔드|백엔드)/i.test(text)) {
+    subject = language === "ko" ? `${mainKeyword} 개발 이슈` : `${titleCase(mainKeyword)} developer issue`;
+    change = language === "ko" ? "간단해 보인 작업이 커짐" : "a simple task turns into a bigger engineering problem";
+    conflict = language === "ko" ? "간단한 수정인 줄 알았는데 디버깅이 시작됨" : "it looked simple until debugging started";
+    consequence = language === "ko" ? "개발자의 하루가 사라짐" : "the developer's day disappears";
+    emotion = language === "ko" ? "개발자 멘붕" : "developer panic";
+    templateIntent = language === "ko" ? "개발자 버그 반응 밈" : "programmer debugging meme";
   }
 
-  if (vibeLower.includes("developer") || vibeLower.includes("programmer") || vibeLower.includes("bug")) {
-    bottomOptions.push(
-      `Also me 6 hours later: debugging ${second}`,
-      `The bug was in my confidence`,
-      `One does not simply "quickly fix" ${third}`,
-    );
+  if (/(company|office|manager|deadline|enterprise|saas|startup|funding|회사|업무|회의|마감|스타트업|투자|기업)/i.test(text)) {
+    subject = language === "ko" ? `${mainKeyword} 업무 이슈` : `${titleCase(mainKeyword)} work issue`;
+    change = language === "ko" ? "작은 요청이 큰 프로젝트가 됨" : "a small request becomes a whole project";
+    conflict = language === "ko" ? "금방 된다던 일이 점점 커짐" : "the quick task is no longer quick";
+    consequence = language === "ko" ? "담당자가 조용히 무너짐" : "the person responsible quietly breaks";
+    emotion = language === "ko" ? "직장인 현실 웃음" : "office worker pain";
+    templateIntent = language === "ko" ? "직장인 공감 밈" : "office work meme";
+  }
+
+  if (/(success|growth|record|launch|viral|win|성공|성장|기록|출시|인기|확산|돌파)/i.test(text)) {
+    change = language === "ko" ? "생각보다 너무 잘됨" : "it works better than expected";
+    conflict = language === "ko" ? "기대보다 커져서 오히려 당황함" : "the success is bigger than expected";
+    consequence = language === "ko" ? "모두가 갑자기 진지해짐" : "everyone suddenly takes it seriously";
+    emotion = language === "ko" ? "성공해서 당황" : "surprised success";
+    templateIntent = language === "ko" ? "성공했는데 당황한 밈" : "unexpected success meme";
+  }
+
+  if (/(risk|crisis|problem|failure|decline|controversy|lawsuit|문제|위기|실패|하락|논란|소송|리스크)/i.test(text)) {
+    change = language === "ko" ? "문제가 예상보다 커짐" : "the problem gets bigger than expected";
+    conflict = language === "ko" ? "처음엔 별일 아닌 줄 알았는데 위험해짐" : "it seemed fine until the risk became obvious";
+    consequence = language === "ko" ? "모두가 눈치 보기 시작함" : "everyone starts quietly panicking";
+    emotion = language === "ko" ? "조용한 패닉" : "quiet panic";
+    templateIntent = language === "ko" ? "위기 반응 밈" : "this is fine crisis meme";
   }
 
   return {
-    topText: pickRandom(topOptions, `Me before reading about ${main}`),
-    bottomText: pickRandom(bottomOptions, `Reality: ${second} changed everything`),
+    topic,
+    subject: short(subject, language === "ko" ? 28 : 40),
+    actor: short(actor, language === "ko" ? 24 : 32),
+    change: short(change, language === "ko" ? 38 : 52),
+    conflict: short(conflict, language === "ko" ? 42 : 64),
+    consequence: short(consequence, language === "ko" ? 36 : 56),
+    jokeAngle: short(
+      language === "ko"
+        ? `${subject}: ${conflict}`
+        : `${subject}: ${conflict}`,
+      language === "ko" ? 48 : 72,
+    ),
+    emotion,
+    templateIntent,
   };
+}
+
+function makeCaption(language: MemeLanguage, brief: MemeContentBrief, keywords: string[]) {
+  const main = brief.subject || keywords[0] || (language === "ko" ? "이 뉴스" : "this update");
+  const actor = brief.actor || keywords[0] || (language === "ko" ? "사람들" : "everyone");
+  const change = brief.change;
+  const conflict = brief.conflict;
+  const consequence = brief.consequence;
+
+  const variant = Math.floor(Math.random() * 8);
+
+  if (language === "ko") {
+    const options = [
+      {
+        topText: `${actor}: ${main} 금방 되죠?`,
+        bottomText: `현실: ${conflict}`,
+      },
+      {
+        topText: `${main} 보기 전의 나`,
+        bottomText: `보고 난 후: ${consequence}`,
+      },
+      {
+        topText: `처음엔 ${main} 그냥 넘겼는데`,
+        bottomText: `알고 보니 ${change}`,
+      },
+      {
+        topText: `나: ${main} 별거 아니겠지`,
+        bottomText: `현실: ${conflict}`,
+      },
+      {
+        topText: `${main} 소식 들은 사람들`,
+        bottomText: `${consequence}`,
+      },
+      {
+        topText: `분명 ${main} 얘기였는데`,
+        bottomText: `갑자기 ${change}`,
+      },
+      {
+        topText: `${actor} 발표 전`,
+        bottomText: `${actor} 발표 후: ${consequence}`,
+      },
+      {
+        topText: `오늘의 인터넷: ${main}`,
+        bottomText: `댓글창: ${conflict}`,
+      },
+    ];
+
+    return options[variant] ?? options[0];
+  }
+
+  const options = [
+    {
+      topText: `${actor}: "${main} should be simple"`,
+      bottomText: `Reality: ${conflict}`,
+    },
+    {
+      topText: `Me before reading about ${main}`,
+      bottomText: `Me after: ${consequence}`,
+    },
+    {
+      topText: `Everyone thought ${main} was just news`,
+      bottomText: `Then ${change}`,
+    },
+    {
+      topText: `Me: "${main} is probably not my problem"`,
+      bottomText: `The problem: ${conflict}`,
+    },
+    {
+      topText: `The article: "${main}"`,
+      bottomText: `The actual story: ${change}`,
+    },
+    {
+      topText: `Before ${main}`,
+      bottomText: `After realizing ${consequence}`,
+    },
+    {
+      topText: `${actor} before the announcement`,
+      bottomText: `${actor} after: ${consequence}`,
+    },
+    {
+      topText: `The internet seeing ${main}`,
+      bottomText: `The comments: ${conflict}`,
+    },
+  ];
+
+  return options[variant] ?? options[0];
 }
 
 export async function generateMemePlan({
@@ -419,39 +364,39 @@ export async function generateMemePlan({
 }: GenerateMemePlanInput): Promise<MemePlan> {
   const cleanText = normalizeText(sourceText);
   const keywords = extractKeywords(cleanText, language);
-  const vibe = detectDynamicVibe(cleanText, language);
-
-  const captionInspiration = await fetchCaptionInspiration({
+  const brief = extractContentBrief(cleanText, language, keywords);
+  const caption = makeCaption(language, brief, keywords);
+  const searchPlan = buildMemeSearchQuery({
     language,
-    vibe,
+    searchText: [
+      brief.topic,
+      brief.subject,
+      brief.change,
+      brief.conflict,
+      brief.consequence,
+      caption,
+    ].join(" "),
     keywords,
   });
-
-  const caption = makeCaption({
-    language,
-    vibe,
-    keywords,
-    inspirationPhrases: captionInspiration.phrases,
-  });
-
-  const searchPlan = buildMemeSearchQuery({ language, vibe, keywords });
 
   const imageUrl = `/api/meme-image?language=${encodeURIComponent(language)}&source=${encodeURIComponent(
     searchPlan.source,
-  )}&q=${encodeURIComponent(searchPlan.searchQuery)}`;
+  )}&q=${encodeURIComponent(searchPlan.searchQuery)}&preferred=${encodeURIComponent(
+    searchPlan.preferredTemplates.join(","),
+  )}`;
 
   return {
     language,
     sourceSummary: cleanText.slice(0, 280),
     keywords,
-    vibe,
-    templateId: "current-caption-inspired",
+    vibe: brief.emotion,
+    contentBrief: brief,
+    templateId: "article-grounded-famous-meme",
     templateName: searchPlan.searchQuery,
     imageUrl,
     imageSource: searchPlan.source,
     searchQuery: searchPlan.searchQuery,
-    captionSearchQuery: captionInspiration.searchQuery,
-    captionInspiration: captionInspiration.phrases,
+    preferredTemplates: searchPlan.preferredTemplates,
     topText: caption.topText,
     bottomText: caption.bottomText,
   };
