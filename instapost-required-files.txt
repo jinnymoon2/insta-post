@@ -1,0 +1,1704 @@
+===== package.json =====
+{
+  "name": "instapost",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "file-saver": "^2.0.5",
+    "html-to-image": "^1.11.13",
+    "jsdom": "^26.1.0",
+    "jspdf": "^4.2.1",
+    "jszip": "^3.10.1",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/file-saver": "^2.0.7",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "eslint": "latest",
+    "eslint-config-next": "latest",
+    "tailwindcss": "^4",
+    "typescript": "latest"
+  }
+}
+
+===== app/page.tsx =====
+"use client";
+
+import { saveAs } from "file-saver";
+import { toPng } from "html-to-image";
+import JSZip from "jszip";
+import type { CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+type InputMode = "url" | "text" | "meme";
+type OutputLanguage = "en" | "ko";
+
+type GeneratedSlide = {
+  title?: string;
+  text?: string;
+  caption?: string;
+  imagePrompt?: string;
+  imageUrl?: string;
+};
+
+type GenerateResponse = {
+  slides?: GeneratedSlide[];
+  error?: string;
+  meta?: {
+    mode?: string;
+    warning?: string;
+  };
+};
+
+type MemeResult = {
+  language: OutputLanguage;
+  sourceSummary: string;
+  keywords: string[];
+  vibe: string;
+  contentBrief?: {
+    topic: string;
+    subject: string;
+    actor: string;
+    change: string;
+    conflict: string;
+    consequence: string;
+    jokeAngle: string;
+    emotion: string;
+    templateIntent: string;
+  };
+  templateId: string;
+  templateName: string;
+  imageUrl: string;
+  imageSource: "imgflip" | "korean-web-meme" | "pexels";
+  searchQuery: string;
+  preferredTemplates?: string[];
+  topText: string;
+  bottomText: string;
+};
+
+type MemeResponse = {
+  meme?: MemeResult;
+  error?: string;
+};
+
+const PAGE_WIDTH = 1080;
+const PAGE_COUNT_OPTIONS = Array.from({ length: 10 }, (_, index) => index + 1);
+
+export default function Home() {
+  const [inputMode, setInputMode] = useState<InputMode>("url");
+  const [url, setUrl] = useState("");
+  const [articleText, setArticleText] = useState("");
+  const [memeUrl, setMemeUrl] = useState("");
+  const [memeText, setMemeText] = useState("");
+  const [language, setLanguage] = useState<OutputLanguage>("en");
+  const [pageCount, setPageCount] = useState(6);
+  const [slides, setSlides] = useState<GeneratedSlide[]>([]);
+  const [memeResult, setMemeResult] = useState<MemeResult | null>(null);
+  const [generationMode, setGenerationMode] = useState("");
+  const [warning, setWarning] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState("");
+  const [failedBackgrounds, setFailedBackgrounds] = useState<Set<number>>(new Set());
+  const [resolvedBgUrls, setResolvedBgUrls] = useState<Map<number, string>>(new Map());
+
+  const slideRefs = useRef<Array<HTMLDivElement | null>>([]);
+  const memeRef = useRef<HTMLDivElement | null>(null);
+
+  const canGenerate = useMemo(() => {
+    if (loading) return false;
+
+    if (inputMode === "url") {
+      return url.trim().length > 0;
+    }
+
+    if (inputMode === "text") {
+      return articleText.trim().length >= 80;
+    }
+
+    const hasMemeUrl = memeUrl.trim().length > 0;
+    const hasMemeText = memeText.trim().length >= 30;
+
+    return hasMemeUrl !== hasMemeText;
+  }, [articleText, inputMode, loading, memeText, memeUrl, url]);
+
+  function resetResultState() {
+    setError("");
+    setWarning("");
+    setGenerationMode("");
+    setSlides([]);
+    setMemeResult(null);
+    setFailedBackgrounds(new Set());
+    setResolvedBgUrls(new Map());
+    slideRefs.current = [];
+  }
+
+  function changeInputMode(nextMode: InputMode) {
+    resetResultState();
+    setInputMode(nextMode);
+  }
+
+  async function handleGenerateSlides() {
+    setLoading(true);
+    resetResultState();
+
+    try {
+      const response = await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: inputMode === "url" ? url : "",
+          articleText: inputMode === "text" ? articleText : "",
+          language,
+          pageCount,
+        }),
+      });
+
+      const data = (await response.json()) as GenerateResponse;
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to generate post.");
+      }
+
+      if (!Array.isArray(data.slides) || data.slides.length === 0) {
+        throw new Error("The server did not return any slides.");
+      }
+
+      setSlides(data.slides);
+      setGenerationMode(data.meta?.mode ?? "generated");
+      setWarning(data.meta?.warning ?? "");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleGenerateMeme() {
+    setLoading(true);
+    resetResultState();
+
+    try {
+      const hasMemeUrl = memeUrl.trim().length > 0;
+      const hasMemeText = memeText.trim().length > 0;
+
+      if (hasMemeUrl === hasMemeText) {
+        throw new Error("Enter either an article URL or text, not both.");
+      }
+
+      const response = await fetch("/api/meme", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          language,
+          articleUrl: hasMemeUrl ? memeUrl.trim() : "",
+          text: hasMemeText ? memeText.trim() : "",
+        }),
+      });
+
+      const data = (await response.json()) as MemeResponse;
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to generate meme.");
+      }
+
+      if (!data.meme) {
+        throw new Error("The server did not return a meme.");
+      }
+
+      setMemeResult(data.meme);
+      setGenerationMode("meme");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleGenerate() {
+    if (inputMode === "meme") {
+      await handleGenerateMeme();
+      return;
+    }
+
+    await handleGenerateSlides();
+  }
+
+  function proxiedImageUrl(imageUrl: string) {
+    return `/api/image?url=${encodeURIComponent(imageUrl)}`;
+  }
+
+  function fallbackImageUrl(slide: GeneratedSlide, index: number) {
+    const prompt = slide.imagePrompt || `${slide.title ?? ""} ${slide.text ?? ""}`.trim();
+
+    return `instapost-generated://slide-${index + 1}/${encodeURIComponent(
+      prompt || `carousel page ${index + 1}`,
+    )}`;
+  }
+
+  function slideBackgroundProxiedUrl(slide: GeneratedSlide, index: number) {
+    const imageUrl = slide.imageUrl ?? "";
+
+    if (!failedBackgrounds.has(index) && imageUrl) {
+      return proxiedImageUrl(imageUrl);
+    }
+
+    return proxiedImageUrl(fallbackImageUrl(slide, index));
+  }
+
+  useEffect(() => {
+    if (slides.length === 0) return;
+
+    let cancelled = false;
+
+    async function resolveOne(slide: GeneratedSlide, index: number): Promise<[number, string]> {
+      const proxiedUrl = slideBackgroundProxiedUrl(slide, index);
+
+      try {
+        const response = await fetch(proxiedUrl);
+        if (!response.ok) throw new Error("fetch failed");
+
+        const blob = await response.blob();
+
+        return await new Promise<[number, string]>((resolve, reject) => {
+          const reader = new FileReader();
+
+          reader.onload = () => resolve([index, reader.result as string]);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+      } catch {
+        return [index, ""];
+      }
+    }
+
+    async function resolveAll() {
+      for (let index = 0; index < slides.length; index += 1) {
+        if (cancelled) return;
+
+        const [, dataUrl] = await resolveOne(slides[index], index);
+
+        if (cancelled) return;
+
+        if (dataUrl) {
+          setResolvedBgUrls((current) => {
+            const next = new Map(current);
+            next.set(index, dataUrl);
+            return next;
+          });
+        }
+      }
+    }
+
+    void resolveAll();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slides, failedBackgrounds]);
+
+  function hasCjkText(value: string) {
+    return /[가-힣一-龥ぁ-んァ-ン]/.test(value);
+  }
+
+  function truncateText(value: string | undefined, maxLength: number) {
+    const cleaned = (value ?? "").replace(/\s+/g, " ").trim();
+
+    if (cleaned.length <= maxLength) return cleaned;
+
+    const sliced = cleaned.slice(0, Math.max(0, maxLength - 1)).trim();
+    const lastSpace = sliced.lastIndexOf(" ");
+    const shouldCutAtWord = lastSpace > maxLength * 0.62 && !hasCjkText(cleaned);
+
+    return `${shouldCutAtWord ? sliced.slice(0, lastSpace) : sliced}…`;
+  }
+
+  function getFittedSlide(slide: GeneratedSlide): Required<GeneratedSlide> {
+    const rawTitle = slide.title ?? "";
+    const rawText = slide.text ?? "";
+    const isCjk = hasCjkText(`${rawTitle} ${rawText}`);
+
+    return {
+      title: truncateText(rawTitle, isCjk ? 30 : 58),
+      text: truncateText(rawText, isCjk ? 108 : 184),
+      caption: slide.caption ?? "",
+      imagePrompt: slide.imagePrompt ?? "",
+      imageUrl: slide.imageUrl ?? "",
+    };
+  }
+
+  function getSlideTextStyle(slide: GeneratedSlide): CSSProperties {
+    const titleLength = slide.title?.length ?? 0;
+    const textLength = slide.text?.length ?? 0;
+    const longestWord = Math.max(
+      0,
+      ...`${slide.title ?? ""} ${slide.text ?? ""}`.split(/\s+/).map((word) => word.length),
+    );
+    const totalLength = titleLength + textLength;
+    const hasCjk = hasCjkText(`${slide.title ?? ""} ${slide.text ?? ""}`);
+
+    const titleSize = Math.max(
+      hasCjk ? 33 : 34,
+      Math.min(hasCjk ? 56 : 60, 60 - titleLength * (hasCjk ? 0.48 : 0.38)),
+    );
+
+    const textSize = Math.max(
+      hasCjk ? 24 : 22,
+      Math.min(
+        hasCjk ? 36 : 35,
+        37 - textLength * (hasCjk ? 0.07 : 0.055) - longestWord * 0.12 - totalLength * 0.01,
+      ),
+    );
+
+    return {
+      "--title-size": `${titleSize}px`,
+      "--text-size": `${textSize}px`,
+      overflowWrap: "anywhere",
+      wordBreak: hasCjk ? "keep-all" : "break-word",
+      hyphens: "auto",
+    } as CSSProperties;
+  }
+
+  async function ensureImagesReady(node: HTMLElement) {
+    const images = Array.from(node.querySelectorAll("img"));
+
+    await Promise.all(
+      images.map(async (image) => {
+        if (image.complete && image.naturalWidth > 0) return;
+
+        await new Promise<void>((resolve) => {
+          image.onload = () => resolve();
+          image.onerror = () => resolve();
+        });
+      }),
+    );
+
+    await Promise.all(
+      images.map(async (image) => {
+        try {
+          await image.decode();
+        } catch {
+          // Ignore decode failures. html-to-image can still try to capture.
+        }
+      }),
+    );
+  }
+
+  async function imageUrlToDataUrl(url: string) {
+    const response = await fetch(url, { cache: "no-store" });
+
+    if (!response.ok) {
+      throw new Error(`Could not load background image. Status: ${response.status}`);
+    }
+
+    const blob = await response.blob();
+
+    return await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error("Could not read background image."));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function loadCanvasImage(src: string) {
+    return await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Could not load background image for canvas export."));
+      image.src = src;
+    });
+  }
+
+  function wrapCanvasText(
+    ctx: CanvasRenderingContext2D,
+    text: string,
+    maxWidth: number,
+    maxLines: number,
+  ) {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    const words = normalized.includes(" ") ? normalized.split(" ") : [...normalized];
+
+    const lines: string[] = [];
+    let currentLine = "";
+
+    for (const word of words) {
+      const separator = normalized.includes(" ") ? " " : "";
+      const testLine = currentLine ? `${currentLine}${separator}${word}` : word;
+
+      if (ctx.measureText(testLine).width <= maxWidth) {
+        currentLine = testLine;
+        continue;
+      }
+
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+
+      if (lines.length >= maxLines) break;
+    }
+
+    if (currentLine && lines.length < maxLines) {
+      lines.push(currentLine);
+    }
+
+    if (lines.length === maxLines && words.length > 0) {
+      const lastIndex = lines.length - 1;
+      while (ctx.measureText(`${lines[lastIndex]}…`).width > maxWidth && lines[lastIndex].length > 1) {
+        lines[lastIndex] = lines[lastIndex].slice(0, -1);
+      }
+      lines[lastIndex] = `${lines[lastIndex]}…`;
+    }
+
+    return lines;
+  }
+
+  function drawCanvasTextBlock({
+    ctx,
+    title,
+    body,
+  }: {
+    ctx: CanvasRenderingContext2D;
+    title: string;
+    body: string;
+  }) {
+    const left = PAGE_WIDTH * 0.07;
+    const maxWidth = PAGE_WIDTH * 0.86;
+    const bottom = PAGE_WIDTH * 0.09;
+
+    const titleLength = [...title].length;
+    const bodyLength = [...body].length;
+
+    const titleSize = titleLength > 34 ? 70 : titleLength > 24 ? 78 : 88;
+    const bodySize = bodyLength > 95 ? 46 : bodyLength > 65 ? 52 : 58;
+
+    ctx.fillStyle = "#ffffff";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+
+    ctx.font = `900 ${titleSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    const titleLines = wrapCanvasText(ctx, title, maxWidth, 3);
+    const titleLineHeight = titleSize * 1.08;
+
+    ctx.font = `700 ${bodySize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    const bodyLines = wrapCanvasText(ctx, body, maxWidth, 4);
+    const bodyLineHeight = bodySize * 1.22;
+
+    const gap = 42;
+    const totalHeight =
+      titleLines.length * titleLineHeight +
+      gap +
+      bodyLines.length * bodyLineHeight;
+
+    let y = PAGE_WIDTH * 1.25 - bottom - totalHeight;
+
+    ctx.font = `900 ${titleSize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    for (const line of titleLines) {
+      ctx.fillText(line, left, y);
+      y += titleLineHeight;
+    }
+
+    y += gap;
+
+    ctx.font = `700 ${bodySize}px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    for (const line of bodyLines) {
+      ctx.fillText(line, left, y);
+      y += bodyLineHeight;
+    }
+  }
+
+  async function getSlidePng(index: number) {
+    const slide = slides[index];
+
+    if (!slide) {
+      throw new Error(`Page ${index + 1} is not ready yet.`);
+    }
+
+    const fittedSlide = getFittedSlide(slide);
+    const bgUrl = resolvedBgUrls.get(index);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = PAGE_WIDTH;
+    canvas.height = Math.round(PAGE_WIDTH * 1.25);
+
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx) {
+      throw new Error("Could not create image canvas.");
+    }
+
+    // Fill the full rectangular canvas first.
+    // This guarantees sharp 90-degree PNG corners instead of rounded card corners.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, canvas.width, canvas.height);
+    ctx.clip();
+
+    ctx.fillStyle = "#111827";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    if (bgUrl) {
+      const dataUrl = await imageUrlToDataUrl(bgUrl);
+      const image = await loadCanvasImage(dataUrl);
+
+      const canvasRatio = canvas.width / canvas.height;
+      const imageRatio = image.width / image.height;
+
+      let drawWidth = canvas.width;
+      let drawHeight = canvas.height;
+      let drawX = 0;
+      let drawY = 0;
+
+      if (imageRatio > canvasRatio) {
+        drawHeight = canvas.height;
+        drawWidth = drawHeight * imageRatio;
+        drawX = (canvas.width - drawWidth) / 2;
+      } else {
+        drawWidth = canvas.width;
+        drawHeight = drawWidth / imageRatio;
+        drawY = (canvas.height - drawHeight) / 2;
+      }
+
+      ctx.drawImage(image, drawX, drawY, drawWidth, drawHeight);
+    }
+
+    ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    drawCanvasTextBlock({
+      ctx,
+      title: fittedSlide.title || "",
+      body: fittedSlide.text || "",
+    });
+
+    ctx.restore();
+
+    return canvas.toDataURL("image/png");
+  }
+
+  async function downloadSlide(index: number) {
+    setDownloading(true);
+    setError("");
+
+    try {
+      const dataUrl = await getSlidePng(index);
+      saveAs(dataUrl, `instapost-page-${index + 1}.png`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not download page.");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  async function downloadAllSlides() {
+    if (slides.length === 0) return;
+
+    setDownloading(true);
+    setError("");
+
+    try {
+      const zip = new JSZip();
+
+      for (let index = 0; index < slides.length; index += 1) {
+        const dataUrl = await getSlidePng(index);
+        const base64 = dataUrl.split(",")[1];
+        zip.file(`instapost-page-${index + 1}.png`, base64, { base64: true });
+      }
+
+      const blob = await zip.generateAsync({ type: "blob" });
+      saveAs(blob, "instapost-carousel.zip");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not download ZIP.");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  async function downloadMeme() {
+    const node = memeRef.current;
+
+    if (!node) {
+      setError("Meme is not ready yet.");
+      return;
+    }
+
+    setDownloading(true);
+    setError("");
+
+    try {
+      await ensureImagesReady(node);
+
+      const dataUrl = await toPng(node, {
+        cacheBust: true,
+        pixelRatio: 2,
+        width: PAGE_WIDTH,
+        height: Math.round(PAGE_WIDTH * 1.25),
+        style: {
+          width: `${PAGE_WIDTH}px`,
+          height: `${Math.round(PAGE_WIDTH * 1.25)}px`,
+        },
+      });
+
+      saveAs(dataUrl, "instapost-meme.png");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not download meme.");
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  function handleMemeUrlChange(value: string) {
+    setMemeUrl(value);
+
+    if (value.trim().length > 0) {
+      setMemeText("");
+    }
+  }
+
+  function handleMemeTextChange(value: string) {
+    setMemeText(value);
+
+    if (value.trim().length > 0) {
+      setMemeUrl("");
+    }
+  }
+
+  return (
+    <main className="min-h-screen bg-[#f6f7fb] px-5 py-8 text-[#111827]">
+      <div className="mx-auto flex w-full max-w-6xl flex-col gap-8">
+        <section className="rounded-[32px] bg-white p-6 shadow-sm md:p-10">
+          <div className="mb-8 flex flex-col gap-3">
+            <p className="text-sm font-semibold uppercase tracking-[0.24em] text-[#667085]">
+              InstaPost
+            </p>
+            <h1 className="text-4xl font-black tracking-[-0.04em] md:text-6xl">
+              Generate Instagram posts from articles
+            </h1>
+            <p className="max-w-2xl text-base leading-7 text-[#667085]">
+              Create carousel slides or one-page memes from an article link or long text.
+            </p>
+          </div>
+
+          <div className="mb-6 grid grid-cols-3 gap-2 rounded-2xl bg-[#f2f4f7] p-2">
+            <button
+              type="button"
+              onClick={() => changeInputMode("url")}
+              className={`rounded-xl px-4 py-3 text-sm font-bold transition ${
+                inputMode === "url" ? "bg-white shadow-sm" : "text-[#667085]"
+              }`}
+            >
+              Article Link
+            </button>
+            <button
+              type="button"
+              onClick={() => changeInputMode("text")}
+              className={`rounded-xl px-4 py-3 text-sm font-bold transition ${
+                inputMode === "text" ? "bg-white shadow-sm" : "text-[#667085]"
+              }`}
+            >
+              Long Text
+            </button>
+            <button
+              type="button"
+              onClick={() => changeInputMode("meme")}
+              className={`rounded-xl px-4 py-3 text-sm font-bold transition ${
+                inputMode === "meme" ? "bg-white shadow-sm" : "text-[#667085]"
+              }`}
+            >
+              Meme
+            </button>
+          </div>
+
+          <div className="grid gap-5">
+            {inputMode === "url" && (
+              <label className="grid gap-2">
+                <span className="text-sm font-bold">Article URL</span>
+                <input
+                  value={url}
+                  onChange={(event) => setUrl(event.target.value)}
+                  placeholder="https://example.com/article"
+                  className="rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827]"
+                />
+              </label>
+            )}
+
+            {inputMode === "text" && (
+              <label className="grid gap-2">
+                <span className="text-sm font-bold">Long Text</span>
+                <textarea
+                  value={articleText}
+                  onChange={(event) => setArticleText(event.target.value)}
+                  placeholder="Paste at least 80 characters..."
+                  rows={10}
+                  className="resize-y rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827]"
+                />
+              </label>
+            )}
+
+            {inputMode === "meme" && (
+              <div className="grid gap-5">
+                <label className="grid gap-2">
+                  <span className="text-sm font-bold">Article URL</span>
+                  <input
+                    value={memeUrl}
+                    disabled={memeText.trim().length > 0}
+                    onChange={(event) => handleMemeUrlChange(event.target.value)}
+                    placeholder="Paste an article link"
+                    className="rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827] disabled:bg-[#f2f4f7] disabled:text-[#98a2b3]"
+                  />
+                </label>
+
+                <div className="text-center text-sm font-bold text-[#98a2b3]">or</div>
+
+                <label className="grid gap-2">
+                  <span className="text-sm font-bold">Text</span>
+                  <textarea
+                    value={memeText}
+                    disabled={memeUrl.trim().length > 0}
+                    onChange={(event) => handleMemeTextChange(event.target.value)}
+                    placeholder="Paste text to turn into a meme"
+                    rows={8}
+                    className="resize-y rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827] disabled:bg-[#f2f4f7] disabled:text-[#98a2b3]"
+                  />
+                </label>
+
+                <p className="rounded-2xl bg-[#f9fafb] p-4 text-sm leading-6 text-[#667085]">
+                  Meme mode creates one page only. It analyzes the article or text, detects the
+                  vibe, chooses a meme template, and writes a Korean or English meme caption.
+                </p>
+              </div>
+            )}
+
+            <div className="grid gap-4 md:grid-cols-2">
+              <label className="grid gap-2">
+                <span className="text-sm font-bold">Language</span>
+                <select
+                  value={language}
+                  onChange={(event) => setLanguage(event.target.value as OutputLanguage)}
+                  className="rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827]"
+                >
+                  <option value="en">English</option>
+                  <option value="ko">Korean</option>
+                </select>
+              </label>
+
+              {inputMode !== "meme" && (
+                <label className="grid gap-2">
+                  <span className="text-sm font-bold">Pages</span>
+                  <select
+                    value={pageCount}
+                    onChange={(event) => setPageCount(Number(event.target.value))}
+                    className="rounded-2xl border border-[#d0d5dd] px-4 py-4 outline-none focus:border-[#111827]"
+                  >
+                    {PAGE_COUNT_OPTIONS.map((count) => (
+                      <option key={count} value={count}>
+                        {count} page{count > 1 ? "s" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleGenerate}
+              disabled={!canGenerate}
+              className="rounded-2xl bg-[#111827] px-6 py-4 text-base font-black text-white transition hover:bg-black disabled:cursor-not-allowed disabled:bg-[#d0d5dd]"
+            >
+              {loading
+                ? inputMode === "meme"
+                  ? "Generating Meme..."
+                  : "Generating..."
+                : inputMode === "meme"
+                  ? "Generate Meme"
+                  : "Generate"}
+            </button>
+
+            {error && (
+              <p className="rounded-2xl bg-[#fef3f2] p-4 text-sm font-bold text-[#d92d20]">
+                {error}
+              </p>
+            )}
+
+            {warning && (
+              <p className="rounded-2xl bg-[#fffaeb] p-4 text-sm font-bold text-[#b54708]">
+                {warning}
+              </p>
+            )}
+
+            {generationMode && (
+              <p className="text-sm font-semibold text-[#667085]">Mode: {generationMode}</p>
+            )}
+          </div>
+        </section>
+
+        {inputMode === "meme" && memeResult && (
+          <section className="rounded-[32px] bg-white p-6 shadow-sm md:p-10">
+            <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h2 className="text-2xl font-black tracking-[-0.03em]">Generated Meme</h2>
+
+              </div>
+
+              <button
+                type="button"
+                onClick={downloadMeme}
+                disabled={downloading}
+                className="rounded-2xl bg-[#111827] px-5 py-3 text-sm font-black text-white disabled:bg-[#d0d5dd]"
+              >
+                {downloading ? "Downloading..." : "Download Meme PNG"}
+              </button>
+            </div>
+
+            <div className="flex justify-center">
+              <div
+                ref={memeRef}
+                className="relative aspect-[4/5] w-full max-w-[480px] overflow-hidden rounded-[28px] bg-black shadow-2xl"
+              >
+                <img
+                  src={`${memeResult.imageUrl}&t=${Date.now()}`}
+                  alt={memeResult.templateName}
+                  className="h-full w-full object-cover"
+                />
+
+                <div className="absolute left-1/2 top-[5%] w-[92%] -translate-x-1/2 text-center text-[clamp(28px,6vw,56px)] font-black uppercase leading-[1.05] tracking-[-0.04em] text-white [text-shadow:3px_3px_0_#000,-3px_3px_0_#000,3px_-3px_0_#000,-3px_-3px_0_#000,0_3px_0_#000,3px_0_0_#000,0_-3px_0_#000,-3px_0_0_#000]">
+                  {memeResult.topText}
+                </div>
+
+                <div className="absolute bottom-[5%] left-1/2 w-[92%] -translate-x-1/2 text-center text-[clamp(28px,6vw,56px)] font-black uppercase leading-[1.05] tracking-[-0.04em] text-white [text-shadow:3px_3px_0_#000,-3px_3px_0_#000,3px_-3px_0_#000,-3px_-3px_0_#000,0_3px_0_#000,3px_0_0_#000,0_-3px_0_#000,-3px_0_0_#000]">
+                  {memeResult.bottomText}
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {slides.length > 0 && (
+          <section className="rounded-[32px] bg-white p-6 shadow-sm md:p-10">
+            <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h2 className="text-2xl font-black tracking-[-0.03em]">Generated Carousel</h2>
+                <p className="mt-2 text-sm text-[#667085]">
+                  {slides.length} page{slides.length > 1 ? "s" : ""} ready.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={downloadAllSlides}
+                disabled={downloading}
+                className="rounded-2xl bg-[#111827] px-5 py-3 text-sm font-black text-white disabled:bg-[#d0d5dd]"
+              >
+                {downloading ? "Downloading..." : "Download ZIP"}
+              </button>
+            </div>
+
+            <div className="grid gap-8 md:grid-cols-2">
+              {slides.map((slide, index) => {
+                const fittedSlide = getFittedSlide(slide);
+                const bgUrl = resolvedBgUrls.get(index);
+                const textStyle = getSlideTextStyle(fittedSlide);
+
+                return (
+                  <article key={index} className="grid gap-3">
+                    <div
+                      ref={(node) => {
+                        slideRefs.current[index] = node;
+                      }}
+                      className="relative aspect-[4/5] w-full overflow-hidden rounded-[28px] bg-[#111827] shadow-xl"
+                      style={{
+                        width: "100%",
+                      }}
+                    >
+                      {bgUrl ? (
+                        <div
+                          data-slide-background
+                          className="absolute inset-0"
+                          style={{
+                            backgroundImage: `url("${bgUrl}")`,
+                            backgroundSize: "cover",
+                            backgroundPosition: "center",
+                            backgroundRepeat: "no-repeat",
+                          }}
+                        />
+                      ) : (
+                        <div className="absolute inset-0 bg-gradient-to-br from-[#111827] to-[#475467]" />
+                      )}
+
+                      <div className="absolute inset-0 bg-black/45" />
+
+                      <div
+                        className="absolute inset-x-[7%] bottom-[7%] top-[7%] flex flex-col justify-end gap-5 text-white"
+                        style={textStyle}
+                      >
+                        <h3
+                          className="font-black leading-[1.05] tracking-[-0.05em]"
+                          style={{
+                            fontSize: "var(--title-size)",
+                          }}
+                        >
+                          {fittedSlide.title}
+                        </h3>
+
+                        <p
+                          className="font-semibold leading-[1.22] tracking-[-0.03em]"
+                          style={{
+                            fontSize: "var(--text-size)",
+                          }}
+                        >
+                          {fittedSlide.text}
+                        </p>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => downloadSlide(index)}
+                      disabled={downloading}
+                      className="rounded-2xl border border-[#d0d5dd] bg-white px-4 py-3 text-sm font-black disabled:text-[#98a2b3]"
+                    >
+                      Download Page {index + 1}
+                    </button>
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        )}
+      </div>
+    </main>
+  );
+}
+
+===== app/globals.css =====
+@import "tailwindcss";
+
+:root {
+  --background: #05070d;
+  --foreground: #f8fbff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top left, rgba(47, 124, 255, 0.24), transparent 30%),
+    radial-gradient(circle at top right, rgba(32, 242, 162, 0.18), transparent 28%),
+    var(--background);
+  color: var(--foreground);
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+img {
+  max-width: 100%;
+}
+===== app/layout.tsx =====
+import type { Metadata } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "InstaPost",
+  description: "Generate Instagram carousel posts from links or long writing.",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  );
+}
+===== app/lib/meme/extractArticleText.ts =====
+function stripHtml(html: string) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, " ")
+    .replace(/<header[\s\S]*?<\/header>/gi, " ")
+    .replace(/<aside[\s\S]*?<\/aside>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export async function extractArticleText(url: string) {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 InstaPost Meme Generator",
+    },
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error(`Could not fetch article. Status: ${response.status}`);
+  }
+
+  const html = await response.text();
+  const text = stripHtml(html);
+
+  if (text.length < 100) {
+    throw new Error("Article text was too short or blocked by the website.");
+  }
+
+  return text.slice(0, 10000);
+}
+
+===== app/lib/meme/generateMemePlan.ts =====
+import {
+  buildMemeSearchQuery,
+  MemeContentBrief,
+  MemeImageSource,
+  MemeLanguage,
+} from "./templates";
+
+export type MemePlan = {
+  language: MemeLanguage;
+  sourceSummary: string;
+  keywords: string[];
+  vibe: string;
+  contentBrief: MemeContentBrief;
+  templateId: string;
+  templateName: string;
+  imageUrl: string;
+  imageSource: MemeImageSource;
+  searchQuery: string;
+  preferredTemplates: string[];
+  topText: string;
+  bottomText: string;
+};
+
+type GenerateMemePlanInput = {
+  language: MemeLanguage;
+  sourceText: string;
+};
+
+function normalizeText(text: string) {
+  return text
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 6000);
+}
+
+function sentenceSplit(text: string) {
+  return text
+    .replace(/\s+/g, " ")
+    .split(/(?<=[.!?。！？])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 20);
+}
+
+function extractKeywords(text: string, language: MemeLanguage) {
+  const cleaned = text
+    .replace(/&#x27;/g, " ")
+    .replace(/&#39;/g, " ")
+    .replace(/&quot;/g, " ")
+    .replace(/&amp;/g, " ")
+    .replace(/[^\p{L}\p{N}\s.-]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  const stopwords =
+    language === "ko"
+      ? new Set([
+          "그리고",
+          "하지만",
+          "있는",
+          "없는",
+          "합니다",
+          "에서",
+          "으로",
+          "에게",
+          "대한",
+          "이번",
+          "오늘",
+          "관련",
+          "것으로",
+          "다고",
+          "했다",
+          "있다",
+          "그",
+          "이",
+          "저",
+          "것",
+          "수",
+          "등",
+          "더",
+          "또",
+          "때",
+          "중",
+          "및",
+          "등을",
+          "통해",
+          "위해",
+        ])
+      : new Set([
+          "the",
+          "and",
+          "or",
+          "but",
+          "this",
+          "that",
+          "with",
+          "from",
+          "about",
+          "into",
+          "their",
+          "there",
+          "have",
+          "has",
+          "was",
+          "were",
+          "will",
+          "would",
+          "could",
+          "should",
+          "when",
+          "what",
+          "which",
+          "while",
+          "because",
+          "through",
+          "for",
+          "are",
+          "not",
+          "you",
+          "your",
+          "its",
+          "it's",
+          "to",
+          "in",
+          "on",
+          "of",
+          "as",
+          "is",
+          "a",
+          "an",
+          "by",
+          "be",
+          "can",
+          "new",
+          "said",
+          "x27",
+          "quot",
+          "amp",
+        ]);
+
+  const counts = new Map<string, number>();
+
+  for (const word of cleaned) {
+    const normalized = word.toLowerCase();
+
+    if (normalized.length < 3) continue;
+    if (/^\d+$/.test(normalized)) continue;
+    if (stopwords.has(normalized)) continue;
+
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 12)
+    .map(([word]) => word);
+}
+
+function findFirstMatch(text: string, patterns: RegExp[]) {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) {
+      return match[1].trim();
+    }
+  }
+
+  return "";
+}
+
+function titleCase(value: string) {
+  return value
+    .split(/\s+/)
+    .map((word) => {
+      if (word.length <= 2) return word;
+      return `${word[0]?.toUpperCase() ?? ""}${word.slice(1)}`;
+    })
+    .join(" ");
+}
+
+function short(value: string, maxLength: number) {
+  const cleaned = value.replace(/\s+/g, " ").trim();
+
+  if (cleaned.length <= maxLength) return cleaned;
+
+  return `${cleaned.slice(0, maxLength - 1).trim()}…`;
+}
+
+function extractContentBrief(text: string, language: MemeLanguage, keywords: string[]): MemeContentBrief {
+  const sentences = sentenceSplit(text);
+  const firstSentence = sentences[0] || text.slice(0, 220);
+  const lower = text.toLowerCase();
+
+  const mainKeyword = keywords[0] || (language === "ko" ? "이 이슈" : "this issue");
+  const secondKeyword = keywords[1] || (language === "ko" ? "변화" : "the change");
+
+  const actor =
+    findFirstMatch(text, [
+      /([A-Z][A-Za-z0-9 .-]{1,40})\s+(?:announced|released|launched|introduced|built|created|plans|said)/,
+      /([가-힣A-Za-z0-9 .-]{2,30})이\s+(?:발표|출시|공개|도입|시작)/,
+      /([가-힣A-Za-z0-9 .-]{2,30})가\s+(?:발표|출시|공개|도입|시작)/,
+    ]) || mainKeyword;
+
+  let topic = short(firstSentence, language === "ko" ? 42 : 64);
+  let subject = mainKeyword;
+  let change = secondKeyword;
+  let conflict = language === "ko" ? "예상보다 일이 커짐" : "it becomes more complicated than expected";
+  let consequence = language === "ko" ? "모두가 당황함" : "everyone has to react";
+  let emotion = language === "ko" ? "당황한 반응" : "confused reaction";
+  let templateIntent = language === "ko" ? "상황 반전 밈" : "plot twist reaction meme";
+
+  if (/(ai|artificial intelligence|gpt|llm|agent|automation|인공지능|생성형|에이전트|자동화)/i.test(text)) {
+    subject = language === "ko" ? `${mainKeyword} AI 변화` : `${titleCase(mainKeyword)} AI shift`;
+    change = language === "ko" ? "AI가 일을 대신하기 시작함" : "AI starts doing the work";
+    conflict = language === "ko" ? "편해졌는데 내 역할이 흔들림" : "it is useful, but everyone's role suddenly feels less safe";
+    consequence = language === "ko" ? "개발자들이 웃으면서 긴장함" : "developers are laughing nervously";
+    emotion = language === "ko" ? "불안한 웃음" : "nervous laughter";
+    templateIntent = language === "ko" ? "AI 때문에 당황한 개발자 밈" : "developer nervous about AI meme";
+  }
+
+  if (/(developer|code|bug|github|deploy|api|frontend|backend|programmer|개발|코드|버그|배포|깃허브|프론트엔드|백엔드)/i.test(text)) {
+    subject = language === "ko" ? `${mainKeyword} 개발 이슈` : `${titleCase(mainKeyword)} developer issue`;
+    change = language === "ko" ? "간단해 보인 작업이 커짐" : "a simple task turns into a bigger engineering problem";
+    conflict = language === "ko" ? "간단한 수정인 줄 알았는데 디버깅이 시작됨" : "it looked simple until debugging started";
+    consequence = language === "ko" ? "개발자의 하루가 사라짐" : "the developer's day disappears";
+    emotion = language === "ko" ? "개발자 멘붕" : "developer panic";
+    templateIntent = language === "ko" ? "개발자 버그 반응 밈" : "programmer debugging meme";
+  }
+
+  if (/(company|office|manager|deadline|enterprise|saas|startup|funding|회사|업무|회의|마감|스타트업|투자|기업)/i.test(text)) {
+    subject = language === "ko" ? `${mainKeyword} 업무 이슈` : `${titleCase(mainKeyword)} work issue`;
+    change = language === "ko" ? "작은 요청이 큰 프로젝트가 됨" : "a small request becomes a whole project";
+    conflict = language === "ko" ? "금방 된다던 일이 점점 커짐" : "the quick task is no longer quick";
+    consequence = language === "ko" ? "담당자가 조용히 무너짐" : "the person responsible quietly breaks";
+    emotion = language === "ko" ? "직장인 현실 웃음" : "office worker pain";
+    templateIntent = language === "ko" ? "직장인 공감 밈" : "office work meme";
+  }
+
+  if (/(success|growth|record|launch|viral|win|성공|성장|기록|출시|인기|확산|돌파)/i.test(text)) {
+    change = language === "ko" ? "생각보다 너무 잘됨" : "it works better than expected";
+    conflict = language === "ko" ? "기대보다 커져서 오히려 당황함" : "the success is bigger than expected";
+    consequence = language === "ko" ? "모두가 갑자기 진지해짐" : "everyone suddenly takes it seriously";
+    emotion = language === "ko" ? "성공해서 당황" : "surprised success";
+    templateIntent = language === "ko" ? "성공했는데 당황한 밈" : "unexpected success meme";
+  }
+
+  if (/(risk|crisis|problem|failure|decline|controversy|lawsuit|문제|위기|실패|하락|논란|소송|리스크)/i.test(text)) {
+    change = language === "ko" ? "문제가 예상보다 커짐" : "the problem gets bigger than expected";
+    conflict = language === "ko" ? "처음엔 별일 아닌 줄 알았는데 위험해짐" : "it seemed fine until the risk became obvious";
+    consequence = language === "ko" ? "모두가 눈치 보기 시작함" : "everyone starts quietly panicking";
+    emotion = language === "ko" ? "조용한 패닉" : "quiet panic";
+    templateIntent = language === "ko" ? "위기 반응 밈" : "this is fine crisis meme";
+  }
+
+  return {
+    topic,
+    subject: short(subject, language === "ko" ? 28 : 40),
+    actor: short(actor, language === "ko" ? 24 : 32),
+    change: short(change, language === "ko" ? 38 : 52),
+    conflict: short(conflict, language === "ko" ? 42 : 64),
+    consequence: short(consequence, language === "ko" ? 36 : 56),
+    jokeAngle: short(
+      language === "ko"
+        ? `${subject}: ${conflict}`
+        : `${subject}: ${conflict}`,
+      language === "ko" ? 48 : 72,
+    ),
+    emotion,
+    templateIntent,
+  };
+}
+
+function makeCaption(language: MemeLanguage, brief: MemeContentBrief, keywords: string[]) {
+  const main = brief.subject || keywords[0] || (language === "ko" ? "이 뉴스" : "this update");
+  const actor = brief.actor || keywords[0] || (language === "ko" ? "사람들" : "everyone");
+  const change = brief.change;
+  const conflict = brief.conflict;
+  const consequence = brief.consequence;
+
+  const variant = Math.floor(Math.random() * 8);
+
+  if (language === "ko") {
+    const options = [
+      {
+        topText: `${actor}: ${main} 금방 되죠?`,
+        bottomText: `현실: ${conflict}`,
+      },
+      {
+        topText: `${main} 보기 전의 나`,
+        bottomText: `보고 난 후: ${consequence}`,
+      },
+      {
+        topText: `처음엔 ${main} 그냥 넘겼는데`,
+        bottomText: `알고 보니 ${change}`,
+      },
+      {
+        topText: `나: ${main} 별거 아니겠지`,
+        bottomText: `현실: ${conflict}`,
+      },
+      {
+        topText: `${main} 소식 들은 사람들`,
+        bottomText: `${consequence}`,
+      },
+      {
+        topText: `분명 ${main} 얘기였는데`,
+        bottomText: `갑자기 ${change}`,
+      },
+      {
+        topText: `${actor} 발표 전`,
+        bottomText: `${actor} 발표 후: ${consequence}`,
+      },
+      {
+        topText: `오늘의 인터넷: ${main}`,
+        bottomText: `댓글창: ${conflict}`,
+      },
+    ];
+
+    return options[variant] ?? options[0];
+  }
+
+  const options = [
+    {
+      topText: `${actor}: "${main} should be simple"`,
+      bottomText: `Reality: ${conflict}`,
+    },
+    {
+      topText: `Me before reading about ${main}`,
+      bottomText: `Me after: ${consequence}`,
+    },
+    {
+      topText: `Everyone thought ${main} was just news`,
+      bottomText: `Then ${change}`,
+    },
+    {
+      topText: `Me: "${main} is probably not my problem"`,
+      bottomText: `The problem: ${conflict}`,
+    },
+    {
+      topText: `The article: "${main}"`,
+      bottomText: `The actual story: ${change}`,
+    },
+    {
+      topText: `Before ${main}`,
+      bottomText: `After realizing ${consequence}`,
+    },
+    {
+      topText: `${actor} before the announcement`,
+      bottomText: `${actor} after: ${consequence}`,
+    },
+    {
+      topText: `The internet seeing ${main}`,
+      bottomText: `The comments: ${conflict}`,
+    },
+  ];
+
+  return options[variant] ?? options[0];
+}
+
+export async function generateMemePlan({
+  language,
+  sourceText,
+}: GenerateMemePlanInput): Promise<MemePlan> {
+  const cleanText = normalizeText(sourceText);
+  const keywords = extractKeywords(cleanText, language);
+  const brief = extractContentBrief(cleanText, language, keywords);
+  const caption = makeCaption(language, brief, keywords);
+  const searchPlan = buildMemeSearchQuery({
+    language,
+    searchText: [
+      brief.topic,
+      brief.subject,
+      brief.change,
+      brief.conflict,
+      brief.consequence,
+      caption,
+    ].join(" "),
+    keywords,
+  });
+
+  const imageUrl = `/api/meme-image?language=${encodeURIComponent(language)}&source=${encodeURIComponent(
+    searchPlan.source,
+  )}&q=${encodeURIComponent(searchPlan.searchQuery)}&preferred=${encodeURIComponent(
+    searchPlan.preferredTemplates.join(","),
+  )}`;
+
+  return {
+    language,
+    sourceSummary: cleanText.slice(0, 280),
+    keywords,
+    vibe: brief.emotion,
+    contentBrief: brief,
+    templateId: "article-grounded-famous-meme",
+    templateName: searchPlan.searchQuery,
+    imageUrl,
+    imageSource: searchPlan.source,
+    searchQuery: searchPlan.searchQuery,
+    preferredTemplates: searchPlan.preferredTemplates,
+    topText: caption.topText,
+    bottomText: caption.bottomText,
+  };
+}
+
+===== app/lib/meme/templates.ts =====
+export type MemeLanguage = "ko" | "en";
+
+export type MemeImageSource = "imgflip" | "korean-web-meme" | "pexels";
+
+export type MemeSearchPlan = {
+  language: MemeLanguage;
+  searchQuery: string;
+  source: MemeImageSource;
+  preferredTemplates: string[];
+};
+
+function cleanSearchPart(value: string) {
+  return value
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function chooseEnglishTemplates(searchText: string) {
+  const lower = searchText.toLowerCase();
+
+  if (/(choice|choose|instead|vs|versus|tradeoff|better|worse)/i.test(lower)) {
+    return ["Drake", "Two Buttons", "Distracted Boyfriend"];
+  }
+
+  if (/(surprise|shock|unexpected|suddenly|plot twist|unbelievable|real)/i.test(lower)) {
+    return ["Surprised Pikachu", "Disaster Girl", "Monkey Puppet", "This Is Fine"];
+  }
+
+  if (/(success|growth|record|win|launch|viral|popular|celebrate)/i.test(lower)) {
+    return ["Success Kid", "Leonardo Dicaprio Cheers", "Drake"];
+  }
+
+  if (/(problem|risk|crisis|failure|decline|hard|difficult|complicated|chaos)/i.test(lower)) {
+    return ["This Is Fine", "One Does Not Simply", "Hide the Pain Harold", "Two Buttons"];
+  }
+
+  if (/(opinion|debate|argument|controversy|hot take|claim)/i.test(lower)) {
+    return ["Change My Mind", "Drake", "Two Buttons"];
+  }
+
+  if (/(ai|artificial intelligence|developer|programmer|code|bug|github|api|deploy)/i.test(lower)) {
+    return ["Drake", "Two Buttons", "One Does Not Simply", "Change My Mind"];
+  }
+
+  return ["Drake", "Distracted Boyfriend", "Two Buttons", "Change My Mind", "This Is Fine"];
+}
+
+export function buildMemeSearchQuery({
+  language,
+  searchText,
+  keywords,
+}: {
+  language: MemeLanguage;
+  searchText: string;
+  keywords: string[];
+}): MemeSearchPlan {
+  const cleanedSearchText = cleanSearchPart(searchText);
+  const cleanedKeywords = keywords.map(cleanSearchPart).filter(Boolean).slice(0, 6);
+
+  if (language === "ko") {
+    return {
+      language,
+      source: "korean-web-meme",
+      preferredTemplates: [
+        "무한도전",
+        "박명수",
+        "유재석",
+        "당황",
+        "충격",
+        "이왜진",
+        "직장인",
+      ],
+      searchQuery: [
+        "한국 유명 밈 짤",
+        "한국 인터넷 밈",
+        cleanedSearchText,
+        ...cleanedKeywords,
+      ]
+        .filter(Boolean)
+        .join(" "),
+    };
+  }
+
+  const preferredTemplates = chooseEnglishTemplates(`${cleanedSearchText} ${cleanedKeywords.join(" ")}`);
+
+  return {
+    language,
+    source: "imgflip",
+    preferredTemplates,
+    searchQuery: [
+      preferredTemplates.join(" "),
+      cleanedSearchText,
+      ...cleanedKeywords,
+      "famous meme template",
+    ]
+      .filter(Boolean)
+      .join(" "),
+  };
+}
+
+export type MemeContentBrief = {
+  topic: string;
+  subject: string;
+  actor: string;
+  change: string;
+  conflict: string;
+  consequence: string;
+  jokeAngle: string;
+  emotion: string;
+  templateIntent: string;
+};
+
+===== relevant references =====
+app/lib/meme/generateMemePlan.ts:16:  imageUrl: string;
+app/lib/meme/generateMemePlan.ts:382:  const imageUrl = `/api/meme-image?language=${encodeURIComponent(language)}&source=${encodeURIComponent(
+app/lib/meme/generateMemePlan.ts:396:    imageUrl,
+app/api/generate/route.ts:24:  imageUrl: string;
+app/api/generate/route.ts:91:    return `Google AI Studio could not generate ${targetLanguageName} summaries because the API quota or billing limit was reached. The app used local fallback slides instead.`;
+app/api/generate/route.ts:95:    return `Google AI Studio took too long to respond. The app used local fallback slides instead.`;
+app/api/generate/route.ts:99:    return `Google AI Studio returned incomplete JSON. The app used local fallback slides instead.`;
+app/api/generate/route.ts:106:  return `AI generation failed, so the app used local fallback slides instead. Original error: ${message}`;
+app/api/generate/route.ts:364:      imageUrl: makeImageUrl(imagePrompt, index, articleKeywords),
+app/api/generate/route.ts:415:  const parsed = JSON.parse(json) as { slides?: ModelSlide[] };
+app/api/generate/route.ts:417:  if (!Array.isArray(parsed.slides)) {
+app/api/generate/route.ts:418:    throw new Error("The AI JSON did not include a slides array.");
+app/api/generate/route.ts:421:  return parsed.slides.map((slide) => ({
+app/api/generate/route.ts:429:  slides: Array<{ title: string; text: string }>,
+app/api/generate/route.ts:433:  if (slides.length < pageCount) return false;
+app/api/generate/route.ts:435:  return slides.slice(0, pageCount).every((slide) => {
+app/api/generate/route.ts:471:    `Create exactly ${pageCount} slides.`,
+app/api/generate/route.ts:472:    "Use this exact shape: {\"slides\":[{\"title\":\"...\",\"text\":\"...\",\"imagePrompt\":\"...\"}]}",
+app/api/generate/route.ts:604:        ? "AI returned invalid Korean slides."
+app/api/generate/route.ts:605:        : "AI returned invalid English slides.",
+app/api/generate/route.ts:623:      imageUrl: makeImageUrl(imagePrompt, index, articleKeywords),
+app/api/generate/route.ts:667:      const slides = await generateSlidesWithAi(articleText, pageCount, language, articleKeywords);
+app/api/generate/route.ts:670:        slides,
+app/api/generate/route.ts:681:        slides: makeExtractiveSlides(articleText, pageCount, language, articleKeywords),
+app/api/meme-image/route.ts:281:  const imageUrl =
+app/api/meme-image/route.ts:288:  if (!imageUrl) {
+app/api/meme-image/route.ts:292:  return imageUrl;
+app/api/meme-image/route.ts:295:async function proxyImage(imageUrl: string) {
+app/api/meme-image/route.ts:296:  const imageResponse = await fetch(imageUrl, {
+app/api/meme-image/route.ts:338:    let imageUrl = "";
+app/api/meme-image/route.ts:341:      imageUrl = await fetchImgflipMemeUrl(query, preferredTemplates);
+app/api/meme-image/route.ts:343:      imageUrl = await fetchKoreanFamousMemeUrl(query);
+app/api/meme-image/route.ts:346:    if (!imageUrl) {
+app/api/meme-image/route.ts:347:      imageUrl = await searchPexelsImageUrl(query, language);
+app/api/meme-image/route.ts:350:    return await proxyImage(imageUrl);
+app/page.tsx:4:import { toPng } from "html-to-image";
+app/page.tsx:17:  imageUrl?: string;
+app/page.tsx:21:  slides?: GeneratedSlide[];
+app/page.tsx:47:  imageUrl: string;
+app/page.tsx:71:  const [slides, setSlides] = useState<GeneratedSlide[]>([]);
+app/page.tsx:76:  const [downloading, setDownloading] = useState(false);
+app/page.tsx:105:    setSlides([]);
+app/page.tsx:139:      if (!Array.isArray(data.slides) || data.slides.length === 0) {
+app/page.tsx:140:        throw new Error("The server did not return any slides.");
+app/page.tsx:143:      setSlides(data.slides);
+app/page.tsx:203:  function proxiedImageUrl(imageUrl: string) {
+app/page.tsx:204:    return `/api/image?url=${encodeURIComponent(imageUrl)}`;
+app/page.tsx:216:    const imageUrl = slide.imageUrl ?? "";
+app/page.tsx:218:    if (!failedBackgrounds.has(index) && imageUrl) {
+app/page.tsx:219:      return proxiedImageUrl(imageUrl);
+app/page.tsx:226:    if (slides.length === 0) return;
+app/page.tsx:252:      for (let index = 0; index < slides.length; index += 1) {
+app/page.tsx:255:        const [, dataUrl] = await resolveOne(slides[index], index);
+app/page.tsx:275:  }, [slides, failedBackgrounds]);
+app/page.tsx:303:      imageUrl: slide.imageUrl ?? "",
+app/page.tsx:358:          // Ignore decode failures. html-to-image can still try to capture.
+app/page.tsx:364:  async function imageUrlToDataUrl(url: string) {
+app/page.tsx:487:    const slide = slides[index];
+app/page.tsx:517:      const dataUrl = await imageUrlToDataUrl(bgUrl);
+app/page.tsx:555:  async function downloadSlide(index: number) {
+app/page.tsx:563:      setError(err instanceof Error ? err.message : "Could not download page.");
+app/page.tsx:569:  async function downloadAllSlides() {
+app/page.tsx:570:    if (slides.length === 0) return;
+app/page.tsx:578:      for (let index = 0; index < slides.length; index += 1) {
+app/page.tsx:587:      setError(err instanceof Error ? err.message : "Could not download ZIP.");
+app/page.tsx:593:  async function downloadMeme() {
+app/page.tsx:607:      const dataUrl = await toPng(node, {
+app/page.tsx:620:      setError(err instanceof Error ? err.message : "Could not download meme.");
+app/page.tsx:654:              Create carousel slides or one-page memes from an article link or long text.
+app/page.tsx:822:                onClick={downloadMeme}
+app/page.tsx:823:                disabled={downloading}
+app/page.tsx:826:                {downloading ? "Downloading..." : "Download Meme PNG"}
+app/page.tsx:836:                  src={`${memeResult.imageUrl}&t=${Date.now()}`}
+app/page.tsx:853:        {slides.length > 0 && (
+app/page.tsx:859:                  {slides.length} page{slides.length > 1 ? "s" : ""} ready.
+app/page.tsx:865:                onClick={downloadAllSlides}
+app/page.tsx:866:                disabled={downloading}
+app/page.tsx:869:                {downloading ? "Downloading..." : "Download ZIP"}
+app/page.tsx:874:              {slides.map((slide, index) => {
+app/page.tsx:895:                            backgroundImage: `url("${bgUrl}")`,
+app/page.tsx:914:                            fontSize: "var(--title-size)",
+app/page.tsx:923:                            fontSize: "var(--text-size)",
+app/page.tsx:933:                      onClick={() => downloadSlide(index)}
+app/page.tsx:934:                      disabled={downloading}
+
+===== git status =====
+?? instapost-editor-inspection.txt
+?? instapost-required-files.txt
